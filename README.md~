@@ -54,31 +54,28 @@ required
 
 2) CUDPP version 2.2
 
-#first ``configure'' following sextractor instructions on "./doc/SExtractor installation - MediaWiki.html", then execute rebuild script(current file)
-#when rebuild, please replace "/home/zhao/gwac/cudpp/cudpp_build/lib/libcudpp.so" with the cudpp library path
-#on your own machine
+Compile steps:
 
+1) install the dependent softwares following the instructions in "./doc/SExtractor installation - MediaWiki.html",
 
-Both HOTPANTS and P-HOTPANTS were developed on Linux. Other operating systems may require minor changes to the source code. Synthetic image is not recommended for inputs.
+2) run "./configure --with-atlas=/usr/local/atlas/lib --with-atlas-incdir=/usr/local/atlas/include --with-fftw=/usr/local/lib"
 
-Modify the GPU-PART parameter in gpu_kernel.cu to set the ratio of GPU workload in Convolving.
+3) Replace the content in ./src/Makefile with ./src/Makefile.bak
 
-Modify the CFITIOS and CUTIL direction in MAKEFILE before conduct ¡°make¡±.
+3) run make, there should be some errors
+
+4) execute rebuild.sh script to patch the compilation
+
+5) run make install to install the executable
 
 
 ==========
 
-Sample
+Sample Usage:
 
-We provide one pair of 1K x 1K images and one pair of 3K x 3K images as input, please use the following commands:
-
-./hotpants -inim input_3K.fit -tmplim templ_3K.fit -outim resd_3K.fit -v 0
-
-or 
-
-./hotpants -inim input_1K.fit -tmplim templ_1K.fit -outim resd_1K.fit -v 0
+sex -c param.sex image4k4k.fits
 
 ==========
 
 Citation:
-Zhao, Yan,  Qiong Luo, Senhong Wang, Chao Wu. "Accelerating Astronomical Image Subtraction on Heterogeneous Processors." eScience (eScience), 2013 IEEE 9th International Conference on. IEEE, 2013.
+Baoxue Zhao,  Qiong Luo, Chao Wu. "Parallelizing Astronomical Source Extraction on the GPU." eScience (eScience), 2013 IEEE 9th International Conference on. IEEE, 2013.
