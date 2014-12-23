@@ -1,0 +1,1762 @@
+/*
+ * cudaanalyse.cu
+ *
+ *  Created on: 17 Mar, 2013
+ *      Author: zhao
+ */
+#include <stdio.h>
+#include "cudatypes.h"
+
+#include "../prefs.h"
+
+//prenalysis before gather up, for level 0 to n.
+// level 0 takes almost half the whole time
+//thresh is a constant here
+
+__device__ float hmedian1(float *ra, int n)
+{
+	int		l, j, ir, i;
+	float	rra;
+
+	if (n<2)
+		return *ra;
+	ra--;
+	for (l = ((ir=n)>>1)+1;;)
+	{
+		if (l>1)
+			rra = ra[--l];
+		else
+		{
+			rra = ra[ir];
+			ra[ir] = ra[1];
+			if (--ir == 1)
+			{
+				ra[1] = rra;
+				return n&1? ra[n/2+1] : (float)((ra[n/2]+ra[n/2+1])/2.0);
+			}
+		}
+		for (j = (i=l)<<1; j <= ir;)
+		{
+			if (j < ir && ra[j] < ra[j+1])
+				++j;
+			if (rra < ra[j])
+			{
+				ra[i] = ra[j];
+				j += (i=j);
+			}
+			else
+				j = ir + 1;
+		}
+		ra[i] = rra;
+	}
+
+	/* (the 'return' is inside the loop!!) */
+}
+
+__global__ void preanalyse_full_kernel(
+		unsigned int *d_cuttedObjLevelArray,
+		unsigned int *d_cuttedObjIndexArray,
+		unsigned int *d_cuttedPixCountArray,
+		unsigned int *d_cuttedObjFlagArray,
+		float		 *d_cuttedDthreshArray,
+		float		 *d_cdPixArray,
+		float		 *d_pixelArray,
+		int			 *d_labelArray,
+		unsigned int **d_pixelIndexArray,
+		/* output starts */
+		unsigned int *d_xmin,
+		unsigned int *d_xmax,
+		unsigned int *d_ymin,
+		unsigned int *d_ymax,
+		unsigned int *d_dnpix,
+		double *d_mx,
+		double *d_my,
+		double *d_mx2,
+		double *d_my2,
+		double *d_mxy,
+		float *d_cxx,
+		float *d_cxy,
+		float *d_cyy,
+		float *d_a,
+		float *d_b,
+		float *d_theta,
+		float *d_abcor,
+		float *d_fdpeak,
+		float *d_dpeak,
+		float *d_fdflux,
+		float *d_dflux,
+		char  *d_singuflag,
+		float *d_amp,
+		/* output ends */
+		int width,
+		int height,
+		float thresh,	//900.***
+		int plistexist_dthresh,
+		int analyse_type,
+		unsigned int numobj)
+{
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid >= numobj)
+		return;
+
+	//get the level the object belongs to.
+	unsigned int level = d_cuttedObjLevelArray[tid];
+	//get the index of the object in original pix index array.
+	unsigned int index = d_cuttedObjIndexArray[tid];
+	//get the number of pixels of the object
+	unsigned int pixcount = d_cuttedPixCountArray[tid];
+
+	unsigned int flag = d_cuttedObjFlagArray[tid];
+
+	//get the right pixel index array
+	unsigned int *pixIndexArray = d_pixelIndexArray[level];
+
+	//start to compute the attributes
+	/*-----  initialize stacks and bounds */
+	float	peak, cpeak, val, cval, minthresh, thresht;
+	double	dthresh,dthresh2, t1t2, darea,
+	mx,my, mx2,my2,mxy,  tv,
+	xm,ym, xm2,ym2,xym,
+	temp,temp2, theta,pmx2,pmy2;
+	int		x, y, xmin,xmax, ymin,ymax,area2, fdnpix, dnpix;
+
+	float rv;
+	int pixIndex;
+
+	dthresh = d_cuttedDthreshArray[tid];
+
+	if (plistexist_dthresh) //false
+		minthresh = BIG;
+	else	//true
+		minthresh = 0.0;
+
+	fdnpix = dnpix = 0;
+	rv = 0.0;
+	peak = cpeak = -BIG;
+	ymin = xmin = 2*MAXPICSIZE;    /* to be really sure!! */
+	ymax = xmax = 0;
+
+	for(int i=index; i<index+pixcount; i++)
+	{
+		pixIndex = pixIndexArray[i];
+		x = pixIndex % width;
+		y = pixIndex / width;
+
+		d_labelArray[pixIndex] = tid;
+
+		if(peak < (val = d_pixelArray[pixIndex]))
+			peak = val;
+		if(cpeak < (cval = d_cdPixArray[pixIndex]))
+			cpeak = cval;
+
+		rv += cval;
+		if (xmin > x)
+			xmin = x;
+		if (xmax < x)
+			xmax = x;
+		if (ymin > y)
+			ymin = y;
+		if (ymax < y)
+			ymax = y;
+		fdnpix++;
+	}
+
+	if(level > 0)
+		flag |= OBJ_MERGED;
+	if(xmin == 0 || xmax == width-1 || ymin == 0 || ymax == height-1)
+		flag |= OBJ_TRUNC;
+
+	/* copy some data to "obj" structure */
+	//obj->fdnpix = (LONG)fdnpix;
+	d_fdflux[tid] = rv;
+	d_fdpeak[tid] = cpeak;
+	d_dpeak[tid]  = peak;
+	d_xmin[tid] = xmin;
+	d_xmax[tid] = xmax;
+	d_ymin[tid] = ymin;
+	d_ymax[tid] = ymax;
+
+	if (analyse_type & ANALYSE_FULL)
+	{
+		mx = my = tv = 0.0;
+		mx2 = my2 = mxy = 0.0;
+		dthresh2 = (dthresh + peak)/2.0;
+		area2 = 0;
+
+		for(int i=index; i<index+pixcount; i++)
+		{
+			pixIndex = pixIndexArray[i];
+			x = pixIndex % width - xmin; /* avoid roundoff errors on big images */
+			y = pixIndex / width - ymin; /* avoid roundoff errors on big images */
+
+			cval = cval = d_cdPixArray[pixIndex];
+			tv += (val = d_pixelArray[pixIndex]);
+
+			if (val>dthresh)
+				dnpix++;
+			if (val > dthresh2)
+				area2++;
+			mx += cval * x;
+			my += cval * y;
+			mx2 += cval * x*x;
+			my2 += cval * y*y;
+			mxy += cval * x*y;
+		}
+
+		/*----- compute object's properties */
+		xm = mx / rv;			/* mean x */
+		ym = my / rv;			/* mean y */
+
+		/*-- In case of blending, use previous barycenters (why?)*/
+		xm2 = mx2 / rv - xm * xm;	/* variance of x */
+		ym2 = my2 / rv - ym * ym;	/* variance of y */
+		xym = mxy / rv - xm * ym;	/* covariance */
+
+		/* Handle fully correlated x/y (which cause a singularity...) */
+		if ((temp2=xm2*ym2-xym*xym)<0.00694)
+		{
+			xm2 += 0.0833333;
+			ym2 += 0.0833333;
+			temp2 = xm2*ym2-xym*xym;
+			d_singuflag[tid] = 1;
+		}
+		else;
+		d_singuflag[tid] = 0;
+
+		if ((fabs(temp=xm2-ym2)) > 0.0)
+			theta = atan2(2.0 * xym,temp) / 2.0;
+		else
+			theta = PI/4.0;
+
+		temp = sqrt(0.25*temp*temp+xym*xym);
+		pmy2 = pmx2 = 0.5*(xm2+ym2);
+		pmx2+=temp;
+		pmy2-=temp;
+
+		d_dnpix[tid] = (flag & OBJ_OVERFLOW)? pixcount:dnpix;
+		d_dflux[tid] = tv;
+		d_mx[tid] = xm+xmin;	/* add back xmin */
+		d_my[tid] = ym+ymin;	/* add back ymin */
+		d_mx2[tid] = xm2;
+		d_my2[tid] = ym2;
+		d_mxy[tid] = xym;
+		d_a[tid] = (float)sqrt(pmx2);
+		d_b[tid] = (float)sqrt(pmy2);
+		d_theta[tid] = theta*180.0/PI;
+
+		d_cxx[tid] = (float)(ym2/temp2);
+		d_cyy[tid] = (float)(xm2/temp2);
+		d_cxy[tid] = (float)(-2*xym/temp2);
+
+		darea = (double)area2 - dnpix;
+		t1t2 = dthresh/dthresh2;
+		if (t1t2>0.0 /* && !prefs.dweight_flag */)
+		{
+			d_abcor[tid] = (darea<0.0?darea:-1.0)/(2*PI*log(t1t2<1.0?t1t2:0.99)*d_a[tid]*d_b[tid]);
+			if (d_abcor[tid] > 1.0)
+				d_abcor[tid] = 1.0;
+		}
+		else
+			d_abcor[tid] = 1.0;
+	}
+	d_cuttedObjFlagArray[tid] = flag;
+
+	float dist = pixcount/(2*PI*d_abcor[tid]*d_a[tid]*d_b[tid]);
+	d_amp[tid] = dist<70.0? thresh*exp(dist) : 4.0*d_fdpeak[tid];
+
+	/* ------------ limitate expansion ! */
+	if (d_amp[tid]>4.0*d_fdpeak[tid])
+		d_amp[tid] = 4.0*d_fdpeak[tid];
+}
+
+__global__ void preanalyse_robust_kernel(
+		unsigned int *d_cuttedObjLevelArray,
+		unsigned int *d_cuttedObjIndexArray,
+		unsigned int *d_cuttedPixCountArray,
+		unsigned int *d_cuttedObjFlagArray,
+		float		 *d_cuttedDthreshArray,
+		unsigned int *d_finalPixelIndexArray,
+		float		 *d_cdPixArray,
+		float		 *d_pixelArray,
+		/* output starts */
+		unsigned int *d_xmin,
+		unsigned int *d_xmax,
+		unsigned int *d_ymin,
+		unsigned int *d_ymax,
+		unsigned int *d_dnpix,
+		double *d_mx,
+		double *d_my,
+		double *d_mx2,
+		double *d_my2,
+		double *d_mxy,
+		float *d_cxx,
+		float *d_cxy,
+		float *d_cyy,
+		float *d_a,
+		float *d_b,
+		float *d_theta,
+		float *d_abcor,
+		float *d_fdpeak,
+		float *d_dpeak,
+		float *d_fdflux,
+		float *d_dflux,
+		char  *d_singuflag,
+		/* output ends */
+		int width,
+		int height,
+		float thresh,
+		int plistexist_dthresh,
+		int analyse_type,
+		unsigned int numobj)
+{
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid >= numobj)
+		return;
+
+	//get the level the object belongs to.
+	unsigned int level = d_cuttedObjLevelArray[tid];
+
+	if(level == 0)
+		return;
+
+	//get the index of the object in original pix index array.
+	unsigned int index = d_cuttedObjIndexArray[tid];
+	//get the number of pixels of the object
+	unsigned int pixcount = d_cuttedPixCountArray[tid];
+
+	unsigned int flag = d_cuttedObjFlagArray[tid];
+
+	//start to compute the attributes
+	/*-----  initialize stacks and bounds */
+	float	peak, cpeak, val, cval, minthresh, thresht;
+	double	dthresh,dthresh2, t1t2, darea,
+	mx,my, mx2,my2,mxy,  tv,
+	xm,ym, xm2,ym2,xym,
+	temp,temp2, theta,pmx2,pmy2;
+	int		x, y, xmin,xmax, ymin,ymax,area2, fdnpix, dnpix;
+
+	float rv;
+	int pixIndex;
+
+	dthresh = d_cuttedDthreshArray[tid];
+
+	if (plistexist_dthresh) //false
+		minthresh = BIG;
+	else	//true
+		minthresh = 0.0;
+
+	fdnpix = dnpix = 0;
+	rv = 0.0;
+	peak = cpeak = -BIG;
+	ymin = xmin = 2*MAXPICSIZE;    /* to be really sure!! */
+	ymax = xmax = 0;
+
+	for(int i=index; i<index+pixcount; i++)
+	{
+		pixIndex = d_finalPixelIndexArray[i];
+		x = pixIndex % width;
+		y = pixIndex / width;
+
+		if(peak < (val = d_pixelArray[pixIndex]))
+			peak = val;
+		if(cpeak < (cval = d_cdPixArray[pixIndex]))
+			cpeak = cval;
+
+		rv += cval;
+		if (xmin > x)
+			xmin = x;
+		if (xmax < x)
+			xmax = x;
+		if (ymin > y)
+			ymin = y;
+		if (ymax < y)
+			ymax = y;
+		fdnpix++;
+	}
+
+	//if(level > 0)
+	//	flag |= OBJ_MERGED;
+	if(xmin == 0 || xmax == width-1 || ymin == 0 || ymax == height-1)
+		flag |= OBJ_TRUNC;
+
+	/* copy some data to "obj" structure */
+	//obj->fdnpix = (LONG)fdnpix;
+	d_fdflux[tid] = rv;
+	d_fdpeak[tid] = cpeak;
+	d_dpeak[tid]  = peak;
+	d_xmin[tid] = xmin;
+	d_xmax[tid] = xmax;
+	d_ymin[tid] = ymin;
+	d_ymax[tid] = ymax;
+
+	if (analyse_type & ANALYSE_FULL)
+	{
+		mx = my = tv = 0.0;
+		mx2 = my2 = mxy = 0.0;
+		dthresh2 = (dthresh + peak)/2.0;
+		area2 = 0;
+
+		for(int i=index; i<index+pixcount; i++)
+		{
+			pixIndex = d_finalPixelIndexArray[i];
+			x = pixIndex % width - xmin; /* avoid roundoff errors on big images */
+			y = pixIndex / width - ymin; /* avoid roundoff errors on big images */
+
+			cval = cval = d_cdPixArray[pixIndex];
+			tv += (val = d_pixelArray[pixIndex]);
+
+			if (val>dthresh)
+				dnpix++;
+			if (val > dthresh2)
+				area2++;
+			mx += cval * x;
+			my += cval * y;
+			mx2 += cval * x*x;
+			my2 += cval * y*y;
+			mxy += cval * x*y;
+		}
+
+		/*----- compute object's properties */
+		xm = mx / rv;			/* mean x */
+		ym = my / rv;			/* mean y */
+
+		/*-- In case of blending, use previous barycenters (why?)*/
+		if (flag & OBJ_MERGED)
+		{
+			double	xn,yn;
+
+			xn = d_mx[tid]-xmin;
+			yn = d_my[tid]-ymin;
+			xm2 = mx2 / rv + xn*xn - 2*xm*xn;
+			ym2 = my2 / rv + yn*yn - 2*ym*yn;
+			xym = mxy / rv + xn*yn - xm*yn - xn*ym;
+			xm = xn;
+			ym = yn;
+		}
+		else
+		{
+			xm2 = mx2 / rv - xm * xm;	/* variance of x */
+			ym2 = my2 / rv - ym * ym;	/* variance of y */
+			xym = mxy / rv - xm * ym;	/* covariance */
+		}
+
+		/* Handle fully correlated x/y (which cause a singularity...) */
+		if ((temp2=xm2*ym2-xym*xym)<0.00694)
+		{
+			xm2 += 0.0833333;
+			ym2 += 0.0833333;
+			temp2 = xm2*ym2-xym*xym;
+			d_singuflag[tid] = 1;
+		}
+		else;
+		d_singuflag[tid] = 0;
+
+		if ((fabs(temp=xm2-ym2)) > 0.0)
+			theta = atan2(2.0 * xym,temp) / 2.0;
+		else
+			theta = PI/4.0;
+
+		temp = sqrt(0.25*temp*temp+xym*xym);
+		pmy2 = pmx2 = 0.5*(xm2+ym2);
+		pmx2+=temp;
+		pmy2-=temp;
+
+		d_dnpix[tid] = (flag & OBJ_OVERFLOW)? pixcount:dnpix;
+		d_dflux[tid] = tv;
+		d_mx[tid] = xm+xmin;	/* add back xmin */
+		d_my[tid] = ym+ymin;	/* add back ymin */
+		d_mx2[tid] = xm2;
+		d_my2[tid] = ym2;
+		d_mxy[tid] = xym;
+		d_a[tid] = (float)sqrt(pmx2);
+		d_b[tid] = (float)sqrt(pmy2);
+		d_theta[tid] = theta*180.0/PI;
+
+		d_cxx[tid] = (float)(ym2/temp2);
+		d_cyy[tid] = (float)(xm2/temp2);
+		d_cxy[tid] = (float)(-2*xym/temp2);
+
+		darea = (double)area2 - dnpix;
+		t1t2 = dthresh/dthresh2;
+		if (t1t2>0.0 /* && !prefs.dweight_flag */)
+		{
+			d_abcor[tid] = (darea<0.0?darea:-1.0)/(2*PI*log(t1t2<1.0?t1t2:0.99)*d_a[tid]*d_b[tid]);
+			if (d_abcor[tid] > 1.0)
+				d_abcor[tid] = 1.0;
+		}
+		else
+			d_abcor[tid] = 1.0;
+	}
+	d_cuttedObjFlagArray[tid] = flag;
+
+}
+
+__device__ float _back(float *d_back, int x, int y, int nx, int ny, int backw, int backh)
+{
+	int		xl,yl, pos;
+	double	dx,dy, cdx;
+	float	*b, b0,b1,b2,b3;
+
+	b = d_back;
+
+	dx = (double)x/backw - 0.5;
+	dy = (double)y/backh - 0.5;
+	dx -= (xl = (int)dx);
+	dy -= (yl = (int)dy);
+
+	if (xl<0)
+	{
+		xl = 0;
+		dx -= 1.0;
+	}
+	else if (xl>=nx-1)
+	{
+		xl = nx<2 ? 0 : nx-2;
+		dx += 1.0;
+	}
+
+	if (yl<0)
+	{
+		yl = 0;
+		dy -= 1.0;
+	}
+	else if (yl>=ny-1)
+	{
+		yl = ny<2 ? 0 : ny-2;
+		dy += 1.0;
+	}
+
+	pos = yl*nx + xl;
+	cdx = 1 - dx;
+
+	b0 = *(b+=pos);		/* consider when nbackx or nbacky = 1 */
+	b1 = nx<2? b0:*(++b);
+	b2 = ny<2? *b:*(b+=nx);
+	b3 = nx<2? *b:*(--b);
+
+	return (float)((1-dy)*(cdx*b0 + dx*b1) + dy*(dx*b2 + cdx*b3));
+}
+
+//prefs.pback_type == LOCAL case is not handled,
+//we only handle prefs.pback_type == GLOBAL
+__global__ void analyse_kernel(
+		unsigned int 	*d_cuttedObjLabelArray,
+		unsigned int 	*d_cuttedObjIndexArray,
+		unsigned int	*d_cuttedPixCountArray,
+		unsigned int	*d_finalPixelIndexArray,
+		unsigned int	*d_npix,
+		unsigned int 	*d_peakx,
+		unsigned int 	*d_peaky,
+		int			**d_iso,
+		float		*d_back,
+		float		*d_sigma,
+		float		*d_cdPixArray,
+		float		*d_pixelArray,
+		float		*d_a,
+		float		*d_b,
+		float		*d_fdflux,
+		float		*d_flux,
+		float		*d_fluxerr,
+		float		*d_peak,
+		float 		*d_bkg,
+		float 		*d_dbkg,
+		float		*d_sigbkg,
+		float		*d_mthresh,
+		float		*d_thresh,
+		float		*d_fwhm,
+		char		*d_singuflag,
+		double		*d_mx,
+		double		*d_my,
+		double		*d_poserr_mx2,
+		double		*d_poserr_my2,
+		double		*d_poserr_mxy,
+		/* flag object vars */
+		double		flagobj_poserr_mx2,
+		int			flagobj_peakx,
+		int			flagobj_iso_0,
+		float		flagobj_fwhm,
+		/* field global vars */
+		float		backsig,
+		double		gain,
+		double		ngamma,
+		float		thresh,
+		float		dthresh,
+		double		satur_level,
+		/*	constant vars */
+		int			plistexist_var,
+		int			plistoff_var,
+		int			prefs_weightgain_flag,
+		int			prefs_clean_flag,
+		int			detect_type,
+		int 		nbackx,
+		int 		nbacky,
+		int			backw,
+		int			backh,
+		int			width,
+		int 		numobj)
+{
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid >= numobj)
+		return;
+
+	d_cuttedObjLabelArray[tid] = tid;
+
+	d_bkg[tid] = _back(d_back,
+			(int)(d_mx[tid]+0.5),
+			(int)(d_my[tid]+0.5),
+			nbackx, nbacky, backw, backh);
+
+	d_dbkg[tid] = 0.0;
+
+	//prefs.pback_type == GLOBAL
+	d_sigbkg[tid] = backsig;
+
+	///////////////////examineiso
+
+	int			i,j,k,h, photoflag,area,errflag, cleanflag,
+	pospeakflag, gainflag;
+	double		tv,sigtv,
+	esum, emx2,emy2,emxy, err,backnoise2,dbacknoise2,
+	xm,ym, x,y,var,var2;
+	float		*heapt,*heapj,*heapk, swap;
+	PIXTYPE		pix, cdpix, tpix, peak,cdpeak;
+
+	/*(?) is it ok to remove static */
+	PIXTYPE		threshs[NISO];
+
+	//we change dynamic allocate to static
+	float 		heap[EXT_MINAREA];
+
+	/* Prepare computation of positional error */
+	esum = emx2 = emy2 = emxy = 0.0;
+	if ((errflag=(*((char *)&flagobj_poserr_mx2))))
+	{
+		dbacknoise2 = backsig*backsig;
+		xm = d_mx[tid];
+		ym = d_my[tid];
+	}
+	else
+		xm = ym = dbacknoise2 = 0.0;	/* to avoid gcc -Wall warnings */
+
+	pospeakflag = (*((char *)&flagobj_peakx));
+	//gain = field->gain;
+	//ngamma = field->ngamma;
+	photoflag = (detect_type==1/*PHOTO*/);
+
+	gainflag = (plistexist_var) && prefs_weightgain_flag;
+
+	h = EXT_MINAREA;
+
+	/* Prepare selection of the heap selection for CLEANing */
+	if ((cleanflag = prefs_clean_flag))
+	{
+		if (d_cuttedPixCountArray[tid] < EXT_MINAREA)
+		{
+			d_mthresh[tid] = 0.0;
+			cleanflag = 0;
+			//heapt = heap = NULL;		/* to avoid gcc -Wall warnings */
+		}
+		else
+		{
+			//heap = (float*)malloc(minarea*sizeof(float));
+			heapt = heap;
+		}
+	}
+	else
+	{
+		d_mthresh[tid] = 0.0;
+		//heapt = heap = NULL;		/* to avoid gcc -Wall warnings */
+	}
+
+	/* Measure essential isophotal parameters in the measurement image... */
+	tv = sigtv = 0.0;
+	var = backnoise2 = backsig*backsig;
+	peak = -BIG;
+	cdpeak = -BIG;
+	//thresh = field->thresh;
+	//dthresh = dfield->dthresh;
+	area = 0;
+
+	unsigned int index = d_cuttedObjIndexArray[tid];
+	unsigned int pixcount = d_cuttedPixCountArray[tid];
+	int pixIndex;
+
+	//added on gpu
+	if(!pospeakflag)
+	{
+		d_peakx[tid] = 0;
+		d_peaky[tid] = 0;
+	}
+
+	for(i=index; i<index+pixcount; i++)
+	{
+		pixIndex = d_finalPixelIndexArray[i];
+		x = pixIndex % width;
+		y = pixIndex / width;
+
+		pix = d_pixelArray[pixIndex]; //PLIST(pixt,value);
+		if (pix>peak)
+			peak = pix;
+
+		cdpix=d_cdPixArray[pixIndex]; //PLISTPIX(pixt,cdvalue);
+
+		if (pospeakflag && cdpix>cdpeak)
+		{
+			cdpeak=cdpix;
+			d_peakx[tid] =  x + 1;
+			d_peaky[tid] =  y + 1;
+		}
+		//if (plistexist_var)
+		//	var = (*((PIXTYPE *)((pixt)+plistoff_var)));//PLISTPIX(pixt, var);
+		if (photoflag)
+		{
+			pix = exp(pix/ngamma);
+			var2 = pix*pix*var;
+		}
+		else
+			var2 = var;
+
+		if (gainflag && pix>0.0 && gain>0.0)
+			var2 += pix/gain*var/backnoise2;
+
+		sigtv += var2;
+
+		if (pix>thresh)
+			area++;
+		tv += pix;
+
+		if (errflag)
+		{
+			err = dbacknoise2;
+			if (gain>0.0 && cdpix>0.0)
+				err += cdpix/gain;
+			x = x - xm;
+			y = y - ym;
+			esum += err;
+			emx2 += err*x*x;
+			emy2 += err*y*y;
+			emxy += err*x*y;
+		}
+
+		/*-- Find the minareath pixel in decreasing intensity for CLEANing */
+		if (cleanflag)
+		{
+			tpix = cdpix - (/*PLISTEXIST(dthresh)?PLISTPIX(pixt, dthresh):*/dthresh);
+			if (h>0)
+				*(heapt++) = (float)tpix;
+			else if (h)
+			{
+				if ((float)tpix>*heap)
+				{
+					*heap = (float)tpix;
+					for (j=0; (k=(j+1)<<1)<=EXT_MINAREA; j=k)
+					{
+						heapk = heap+k;
+						heapj = heap+j;
+						if (k != EXT_MINAREA && *(heapk-1) > *heapk)
+						{
+							heapk++;
+							k++;
+						}
+						if (*heapj <= *(--heapk))
+							break;
+						swap = *heapk;
+						*heapk = *heapj;
+						*heapj = swap;
+					}
+				}
+			}
+			else
+				hmedian1(heap, EXT_MINAREA);
+			h--;
+		}
+	}
+
+	/* Flagging from the flag-map */
+	//if (PLISTEXIST(flag)) //false
+	//	getflags(obj, pixel);
+
+	if (cleanflag)
+	{
+		d_mthresh[tid] = *heap;
+		//free(heap);
+	}
+
+	if (errflag)
+	{
+		double	flux2;
+
+		flux2 = d_fdflux[tid]*d_fdflux[tid];
+		/*-- Estimation of the error ellipse moments: we re-use previous variables */
+		emx2 /= flux2;	/* variance of xm */
+		emy2 /= flux2;	/* variance of ym */
+		emxy /= flux2;	/* covariance */
+
+		/*-- Handle fully correlated profiles (which cause a singularity...) */
+		esum *= 0.08333/flux2;
+		if (d_singuflag[tid] && (emx2*emy2-emxy*emxy) < esum*esum)
+		{
+			emx2 += esum;
+			emy2 += esum;
+		}
+
+		d_poserr_mx2[tid] = emx2;
+		d_poserr_my2[tid] = emy2;
+		d_poserr_mxy[tid] = emxy;
+	}
+
+	if (photoflag)
+	{
+		tv = ngamma*(tv-d_cuttedPixCountArray[tid]*exp(d_dbkg[tid]/ngamma));
+		sigtv /= ngamma*ngamma;
+	}
+	else
+	{
+		tv -= d_cuttedPixCountArray[tid]*d_dbkg[tid];
+		if (!gainflag && gain > 0.0 && tv>0.0)
+			sigtv += tv/gain;
+	}
+
+	d_npix[tid] = area;
+	d_flux[tid] = tv;
+	d_fluxerr[tid] = sigtv;
+	//d_peak[tid] = peak;
+
+	d_thresh[tid] = thresh - d_dbkg[tid];
+	d_peak[tid] = peak - d_dbkg[tid];
+
+	/* Initialize isophotal thresholds so as to sample optimally the full profile*/
+
+	if (*((char *)&flagobj_iso_0))
+	{
+		int	**iso;
+		PIXTYPE	*thresht;
+
+		//memset(obj->iso, 0, NISO*sizeof(int));
+		if (detect_type == 1/*PHOTO*/)
+			for (i=0; i<NISO; i++)
+				threshs[i] = d_thresh[tid] + (d_peak[tid]-d_thresh[tid])*i/NISO;
+		else
+		{
+			if (d_peak[tid]>0.0 && d_thresh[tid]>0.0)
+				for (i=0; i<NISO; i++)
+					threshs[i] = d_thresh[tid]*pow((double)d_peak[tid]/d_thresh[tid], (double)i/NISO);
+			else
+				for (i=0; i<NISO; i++)
+					threshs[i] = 0.0;
+		}
+
+		for(j=index; j<index+pixcount; j++)
+		{
+			pixIndex = d_finalPixelIndexArray[j];
+			//pix = d_pixelArray[pixIndex]; //PLIST(pixt,value);
+
+			for (i=NISO,iso=d_iso,thresht=threshs;
+					i-- && d_pixelArray[pixIndex]>*(thresht++);)
+				((*(iso++))[tid])++;
+		}
+	}
+
+	/* Put objects in "segmentation check-image" */
+	/*
+	if ((check = prefs.check[CHECK_SEGMENTATION]))
+		for (pixt=pixel+obj->firstpix; pixt>=pixel; pixt=pixel+PLIST(pixt,nextpix))
+			((ULONG *)check->pix)[check->width*PLIST(pixt,y)+PLIST(pixt,x)]
+			                      = (ULONG)obj->number;
+
+	if ((check = prefs.check[CHECK_OBJECTS]))
+		for (pixt=pixel+obj->firstpix; pixt>=pixel; pixt=pixel+PLIST(pixt,nextpix))
+			((PIXTYPE *)check->pix)[check->width*PLIST(pixt,y)+PLIST(pixt,x)]
+			                        = PLIST(pixt,value);
+	 */
+
+
+	/* Compute the FWHM of the object */
+	if (*((char *)&flagobj_fwhm))
+	{
+		PIXTYPE	thresh0;
+
+		thresh0 = d_peak[tid]/5.0;
+		if (thresh0<d_thresh[tid])
+			thresh0 = d_thresh[tid];
+		if (thresh0>0.0)
+		{
+			double	mx,my, s,sx,sy,sxx,sxy, dx,dy,d2, lpix,pix, b, inverr2, sat,
+			dbkg, d, bmax;
+
+			mx = d_mx[tid];
+			my = d_my[tid];
+			dbkg = d_dbkg[tid];
+			sat = (double)(satur_level - dbkg);
+			s = sx = sy = sxx = sxy = 0.0;
+
+			for(j=index; j<index+pixcount; j++)
+			{
+				pixIndex = d_finalPixelIndexArray[j];
+				x = pixIndex % width;
+				y = pixIndex / width;
+
+				pix = d_pixelArray[pixIndex] - dbkg; //PLIST(pixt,value);
+
+				if (pix>thresh0 && pix<sat)
+				{
+					dx = x - mx;
+					dy = y - my;
+					lpix = log(pix);
+					inverr2 = pix*pix;
+					s += inverr2;
+					d2 = dx*dx+dy*dy;
+					sx += d2*inverr2;
+					sxx += d2*d2*inverr2;
+					sy += lpix*inverr2;
+					sxy += lpix*d2*inverr2;
+				}
+			}
+			d = s*sxx-sx*sx;
+
+			if (fabs(d)>0.0)
+			{
+				b = -(s*sxy-sx*sy)/d;
+				if (b<(bmax = 1/(13*d_a[tid]*d_b[tid])))	/* to have FWHM # 6 sigma */
+					b = bmax;
+				d_fwhm[tid] = (float)(1.6651/sqrt(b));
+				/*----- correction for undersampling effects (established from simulations) */
+				if (d_fwhm[tid] > 0.0)
+					d_fwhm[tid] -= 1/(4*d_fwhm[tid]);
+			}
+			else
+				d_fwhm[tid] = 0.0;
+		}
+		else
+			d_fwhm[tid] = 0.0;
+	}
+}
+
+__global__ void removepixel_kernel(float *d_pixelArray,
+		float *d_cdPixArray,
+		float threshold,
+		int width,
+		int height)
+{
+	const int tid_x = blockDim.x * blockIdx.x + threadIdx.x;
+	const int tid_y = blockDim.y * blockIdx.y + threadIdx.y;
+
+	if(tid_x < width && tid_y < height) {
+
+		const int tid = tid_y * width + tid_x;
+
+		if(d_cdPixArray[tid] >= threshold)
+		{
+			d_pixelArray[tid] = -BIG;
+		}
+	}
+}
+
+__global__ void endobject_kernel(
+
+		unsigned int *d_flag,
+		int			**d_iso,
+		float		*d_a,
+		float		*d_b,
+		float		*d_peak,
+		float		*d_bkg,
+		double		*d_mx,
+		double		*d_my,
+		double		*d_poserr_mx2,
+		double		*d_poserr_my2,
+		double		*d_poserr_mxy,
+		double 		*d_posx,
+		double		*d_posy,
+		float		*d_elong,
+		float		*d_ellip,
+		float		*d_polar,
+		float		*d_sprob,
+		float		*d_sposx,
+		float		*d_sposy,
+		float		*d_poserr_a,
+		float		*d_poserr_b,
+		float		*d_poserr_theta,
+		float		*d_poserr_cxx,
+		float		*d_poserr_cyy,
+		float		*d_poserr_cxy,
+		float		*d_flux,
+		float		*d_flux_iso,
+		float		*d_fluxerr,
+		float		*d_fluxerr_iso,
+
+		float		flagobj2_poserr_a,
+		float		flagobj2_poserr_cxx,
+		float		flagobj2_elong,
+		float		flagobj2_ellip,
+		float		flagobj2_polar,
+		float		flagobj2_flux_isocor,
+		float		*flagobj2_flux_aper,
+		float		*flagobj2_x_psf,
+		float		*flagobj2_y_psf,
+		float		*flagobj2_flux_psf,
+		float		*flagobj2_mag_psf,
+		float		*flagobj2_magerr_psf,
+		float		*flagobj2_fluxerr_psf,
+
+		float		flagobj2_flux_auto,
+		float		flagobj2_flux_petro,
+		float       flagobj2_sprob,
+        float       flagobj2_vignet,
+        float       flagobj2_vigshift,
+		double		flagobj2_winpos_x,
+
+		prefstruct	*d_prefs,
+		int			prefs_naper,
+		int			prefs_growth_flag,
+		int			prefs_world_flag,
+		int			prefs_psf_flag,
+		double		prefs_seeing_fwhm,
+		psfdisplay_type prefs_psfdisplay_type,
+		/*---field vars---*/
+		float		thresh,
+		double		satur_level,
+		double		pixscale,
+
+		int numobj)
+{
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid >= numobj)
+		return;
+
+	////////////////
+
+	int		i,j, ix,iy,selecflag, newnumber,nsub;
+
+	/* Source position */
+	d_sposx[tid] = (float)(d_posx[tid] = d_mx[tid]+1.0); /* That's standard FITS */
+	d_sposy[tid] = (float)(d_posy[tid] = d_my[tid]+1.0);
+
+	/* Integer coordinates */
+	ix=(int)(d_mx[tid]+0.49999);
+	iy=(int)(d_my[tid]+0.49999);
+
+	/* Association */
+	//if (prefs.assoc_flag) //false
+	//	obj2->assoc_number = do_assoc(field, obj2->sposx, obj2->sposy);
+
+	//if (prefs.assoc_flag && prefs.assocselec_type!=ASSOCSELEC_ALL) //false
+	//	selecflag = (prefs.assocselec_type==ASSOCSELEC_MATCHED)?
+	//			obj2->assoc_number:!obj2->assoc_number;
+	//else
+	selecflag = 1;
+
+	if (selecflag)
+	{
+		/*-- Paste back to the image the object's pixels if BLANKing is on */
+		if (d_prefs->blank_flag)
+		{
+//			pasteimage(field, obj->blank, obj->subw, obj->subh,
+//					obj->subx, obj->suby);
+//			if (obj->dblank)
+//				pasteimage(dfield, obj->dblank, obj->subw, obj->subh,
+//						obj->subx, obj->suby);
+		}
+
+		/*------------------------- Error ellipse parameters ------------------------*/
+		if (*((char *)&flagobj2_poserr_a))
+		{
+			double	pmx2,pmy2,temp,theta;
+
+			if (fabs(temp=d_poserr_mx2[tid]-d_poserr_my2[tid]) > 0.0)
+				theta = atan2(2.0 * d_poserr_mxy[tid],temp) / 2.0;
+			else
+				theta = PI/4.0;
+
+			temp = sqrt(0.25*temp*temp+d_poserr_mxy[tid]*d_poserr_mxy[tid]);
+			pmy2 = pmx2 = 0.5*(d_poserr_mx2[tid]+d_poserr_my2[tid]);
+			pmx2+=temp;
+			pmy2-=temp;
+
+			d_poserr_a[tid] = (float)sqrt(pmx2);
+			d_poserr_b[tid] = (float)sqrt(pmy2);
+			d_poserr_theta[tid] = theta*180.0/PI;
+		}
+
+		if (*((char *)&flagobj2_poserr_cxx))
+		{
+			double	xm2,ym2, xym, temp;
+
+			xm2 = d_poserr_mx2[tid];
+			ym2 = d_poserr_my2[tid];
+			xym = d_poserr_mxy[tid];
+			d_poserr_cxx[tid] = (float)(ym2/(temp=xm2*ym2-xym*xym));
+			d_poserr_cyy[tid] = (float)(xm2/temp);
+			d_poserr_cxy[tid] = (float)(-2*xym/temp);
+		}
+
+		/* ---- Aspect ratio */
+
+		if (*((char *)&flagobj2_elong))
+			d_elong[tid] = d_a[tid]/d_b[tid];
+
+		if (*((char *)&flagobj2_ellip))
+			d_ellip[tid] = 1-d_b[tid]/d_a[tid];
+
+		if (*((char *)&flagobj2_polar))
+			d_polar[tid] = (d_a[tid]*d_a[tid] - d_b[tid]*d_b[tid])
+			/ (d_a[tid]*d_a[tid] + d_b[tid]*d_b[tid]);
+
+		/*------------------------------- Photometry -------------------------------*/
+
+		/*-- Convert the father of photom. error estimates from variance to RMS */
+		d_flux_iso[tid] = d_flux[tid];
+		d_fluxerr_iso[tid] = sqrt(d_fluxerr[tid]);
+
+		if (*((char *)&flagobj2_flux_isocor))
+			//computeisocorflux(field, obj);
+
+		if (*((char *)&flagobj2_flux_aper))
+			for (i=0; i<prefs_naper; i++)
+				//computeaperflux(field, wfield, obj, i);
+
+		if (*((char *)&flagobj2_flux_auto))
+			//computeautoflux(field, dfield, wfield, dwfield, obj);
+
+		if (*((char *)&flagobj2_flux_petro))
+			//computepetroflux(field, dfield, wfield, dwfield, obj);
+
+		/*-- Growth curve */
+		if (prefs_growth_flag)
+			//makeavergrowth(field, wfield, obj);
+
+		/*--------------------------- Windowed barycenter --------------------------*/
+		if (*((char *)&flagobj2_winpos_x))
+			//compute_winpos(field, wfield, obj);
+
+		/*-- What about the peak of the profile? */
+		if (d_peak[tid]+d_bkg[tid] >= satur_level)
+			d_flag[tid] |= OBJ_SATUR;
+
+		/*-- Check-image CHECK_APERTURES option */
+
+//		if ((check = prefs.check[CHECK_APERTURES])) //false
+//		{
+//			if (FLAG(obj2.flux_aper))
+//				for (i=0; i<prefs.naper; i++)
+//					sexcircle(check->pix, check->width, check->height,
+//							obj->mx, obj->my, prefs.apert[i]/2.0, check->overlay);
+//
+//			if (FLAG(obj2.flux_auto))
+//				sexellips(check->pix, check->width, check->height,
+//						obj->mx, obj->my, obj->a*obj2->kronfactor,
+//						obj->b*obj2->kronfactor, obj->theta,
+//						check->overlay, obj->flag&OBJ_CROWDED);
+//
+//			if (FLAG(obj2.flux_petro))
+//				sexellips(check->pix, check->width, check->height,
+//						obj->mx, obj->my, obj->a*obj2->petrofactor,
+//						obj->b*obj2->petrofactor, obj->theta,
+//						check->overlay, obj->flag&OBJ_CROWDED);
+//		}
+
+		/* ---- Star/Galaxy classification */
+
+		if (*((char *)&flagobj2_sprob))
+		{
+			double	fac2, input[10], output, fwhm;
+
+			fwhm = prefs_seeing_fwhm;
+
+			fac2 = fwhm/pixscale;
+			fac2 *= fac2;
+			input[j=0] = log10(d_iso[0][tid]? d_iso[0][tid]/fac2: 0.01);
+			input[++j] = thresh>0.0?
+					log10(d_peak[tid]>0.0? d_peak[tid]/thresh: 0.1) :-1.0;
+			for (i=1; i<NISO; i++)
+				input[++j] = log10(d_iso[i][tid]? d_iso[i][tid]/fac2: 0.01);
+			input[++j] = log10(fwhm);
+			//neurresp(input, &output);
+			d_sprob[tid] = (float)output;
+		}
+
+		/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+		/*-- Put here your calls to "BLIND" custom functions. Ex:
+
+    compute_myotherparams(obj);
+
+--*/
+
+		/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+//		newnumber = ++thecat.ntotal;
+//		/*-- update segmentation map */
+//		if ((check=prefs.check[CHECK_SEGMENTATION])) //false
+//		{
+//			ULONG	*pix;
+//			ULONG	newsnumber = newnumber,
+//					oldsnumber = obj->number;
+//			int	dx,dx0,dy,dpix;
+//
+//			pix = (ULONG *)check->pix + check->width*obj->ymin + obj->xmin;
+//			dx0 = obj->xmax-obj->xmin+1;
+//			dpix = check->width-dx0;
+//			for (dy=obj->ymax-obj->ymin+1; dy--; pix += dpix)
+//				for (dx=dx0; dx--; pix++)
+//					if (*pix==oldsnumber)
+//						*pix = newsnumber;
+//		}
+//		obj->number = newnumber;
+
+//		/*-- SOM fitting */
+//		if (prefs.somfit_flag) //false
+//		{
+//			float    *input;
+//
+//			input = thesom->input;
+//			copyimage(field,input,thesom->inputsize[0],thesom->inputsize[1],ix,iy);
+//
+//			if (thesom->nextrainput)
+//			{
+//				input += thesom->ninput-thesom->nextrainput;
+//				*(input) = (obj->mx+1)/field->width;
+//				*(input+1) = (obj->my+1)/field->height;
+//			}
+//
+//			som_phot(thesom, obj->bkg, field->backsig,
+//					(float)field->gain, obj->mx-ix, obj->my-iy,
+//					FLAG(obj2.vector_somfit)?outobj2.vector_somfit:NULL, -1.0);
+//			obj2->stderr_somfit = thesom->stderror;
+//			obj2->flux_somfit = thesom->amp;
+//			outobj2.fluxerr_somfit = thesom->sigamp;
+//		}
+
+//		if (FLAG(obj2.vignet)) //false
+//			copyimage(field,outobj2.vignet,prefs.vignetsize[0],prefs.vignetsize[1],
+//					ix,iy);
+//
+//		if (FLAG(obj2.vigshift)) //false
+//			copyimage_center(field, outobj2.vigshift, prefs.vigshiftsize[0],
+//					prefs.vigshiftsize[1], obj->mx, obj->my);
+
+//		/*------------------------------- PSF fitting ------------------------------*/
+//		nsub = 1;
+//		if (prefs.psf_flag)	//false
+//		{
+//			if (prefs.dpsf_flag)
+//				double_psf_fit(ppsf, field, wfield, obj, thepsf, dfield, dwfield);
+//			else
+//				psf_fit(thepsf, field, wfield, obj);
+//			obj2->npsf = thepsfit->npsf;
+//			if (prefs.psfdisplay_type == PSFDISPLAY_SPLIT)
+//			{
+//				nsub = thepsfit->npsf;
+//				if (nsub<1)
+//					nsub = 1;
+//			}
+//			else
+//				for (j=0; j<thepsfit->npsf; j++)
+//				{
+//					if (FLAG(obj2.x_psf) && j<prefs.psf_xsize)
+//						obj2->x_psf[j] = thepsfit->x[j];
+//					if (FLAG(obj2.y_psf) && j<prefs.psf_ysize)
+//						obj2->y_psf[j] = thepsfit->y[j];
+//					if (FLAG(obj2.flux_psf) && j<prefs.psf_fluxsize)
+//						obj2->flux_psf[j] = thepsfit->flux[j];
+//					if (FLAG(obj2.magerr_psf) && j<prefs.psf_magerrsize)
+//						obj2->magerr_psf[j] = obj2->fluxerr_psf[j]>0.0?
+//								1.086*obj2->fluxerr_psf[j]/thepsfit->flux[j] : 99.0;
+//					if (FLAG(obj2.fluxerr_psf) && j<prefs.psf_fluxerrsize)
+//						obj2->fluxerr_psf[j] = obj2->fluxerr_psf[j];
+//					if (FLAG(obj2.mag_psf) && j<prefs.psf_magsize)
+//						obj2->mag_psf[j] = thepsfit->flux[j]>0.0?
+//								prefs.mag_zeropoint -2.5*log10(thepsfit->flux[j]) : 99.0;
+//				}
+//		}
+
+		/*----------------------------- Profile fitting -----------------------------*/
+//		nsub = 1;
+//		if (prefs.prof_flag) //false
+//			profit_fit(theprofit, field, wfield, obj, obj2);
+
+		/*--- Express everything in magnitude units */
+		//computemags(field, obj);
+
+		/*-------------------------------- Astrometry ------------------------------*/
+		if (prefs_world_flag) //true
+			//computeastrom(field, obj);
+
+		/*-- Edit min and max coordinates to follow the FITS conventions */
+		d_xmin[tid] += 1;
+		d_ymin[tid] += 1;
+		d_xmax[tid] += 1;
+		d_ymax[tid] += 1;
+
+		/*-- Go through each newly identified component */
+		for (j=0; j<nsub; j++)
+		{
+//			if (prefs_psf_flag && prefs_psfdisplay_type == PSFDISPLAY_SPLIT)
+//			{
+//
+//				if (*((char *)&flagobj2_x_psf))
+//					obj2->x_psf[0] = thepsfit->x[j];
+//				if (FLAG(obj2.y_psf))
+//					obj2->y_psf[0] = thepsfit->y[j];
+//				if (FLAG(obj2.flux_psf))
+//					obj2->flux_psf[0] = thepsfit->flux[j]>0.0? thepsfit->flux[j]:0.0; /*?*/
+//							if (FLAG(obj2.mag_psf))
+//								obj2->mag_psf[0] = thepsfit->flux[j]>0.0?
+//										prefs.mag_zeropoint -2.5*log10(thepsfit->flux[j]) : 99.0;
+//							if (FLAG(obj2.magerr_psf))
+//								obj2->magerr_psf[0]=
+//										(thepsfit->flux[j]>0.0 && obj2->fluxerr_psf[j]>0.0) ? /*?*/
+//												1.086*obj2->fluxerr_psf[j]/thepsfit->flux[j] : 99.0;
+//							if (FLAG(obj2.fluxerr_psf))
+//								obj2->fluxerr_psf[0]= obj2->fluxerr_psf[j];
+//							if (j)
+//								obj->number = ++thecat.ntotal;
+//			}
+//
+//			FPRINTF(OUTPUT, "%8d %6.1f %6.1f %5.1f %5.1f %12g "
+//					"%c%c%c%c%c%c%c%c\n",
+//					obj->number, obj->mx+1.0, obj->my+1.0,
+//					obj->a, obj->b,
+//					obj->flux,
+//					obj->flag&OBJ_CROWDED?'C':'_',
+//							obj->flag&OBJ_MERGED?'M':'_',
+//									obj->flag&OBJ_SATUR?'S':'_',
+//											obj->flag&OBJ_TRUNC?'T':'_',
+//													obj->flag&OBJ_APERT_PB?'A':'_',
+//															obj->flag&OBJ_ISO_PB?'I':'_',
+//																	obj->flag&OBJ_DOVERFLOW?'D':'_',
+//																			obj->flag&OBJ_OVERFLOW?'O':'_');
+//			writecat(n, objlist);
+		}
+	}
+	else
+	{
+//		/*-- Treatment of discarded detections */
+//		/*-- update segmentation map */
+//		if ((check=prefs.check[CHECK_SEGMENTATION]))
+//		{
+//			ULONG	*pix;
+//			ULONG	oldsnumber = obj->number;
+//			int	dx,dx0,dy,dpix;
+//
+//			pix = (ULONG *)check->pix + check->width*obj->ymin + obj->xmin;
+//			dx0 = obj->xmax-obj->xmin+1;
+//			dpix = check->width-dx0;
+//			for (dy=obj->ymax-obj->ymin+1; dy--; pix += dpix)
+//				for (dx=dx0; dx--; pix++)
+//					if (*pix==oldsnumber)
+//						*pix = 0;
+//		}
+	}
+
+	/* Remove again from the image the object's pixels if BLANKing is on ... */
+	/*-- ... and free memory */
+
+//	if (prefs.blank_flag && obj->blank)
+//	{
+//		if (selecflag)
+//		{
+//			if (prefs.somfit_flag && (check=prefs.check[CHECK_MAPSOM]))
+//				blankcheck(check, obj->blank, obj->subw, obj->subh,
+//						obj->subx, obj->suby, (PIXTYPE)*(obj2->vector_somfit));
+//
+//		}
+//		blankimage(field, obj->blank, obj->subw, obj->subh,
+//				obj->subx, obj->suby, -BIG);
+//		free(obj->blank);
+//		if (obj->dblank)
+//		{
+//			blankimage(dfield, obj->dblank, obj->subw, obj->subh,
+//					obj->subx, obj->suby, -BIG);
+//			free(obj->dblank);
+//		}
+//	}
+
+	return;
+
+}
+//__global__ void 	copyobj_kernel(
+//		unsigned int	*d_index,
+//		unsigned int	*d_flag,
+//		unsigned int	*d_fdnpix,
+//		float			*d_dthresh,
+//
+//		unsigned int 	*d_xmin,
+//		unsigned int 	*d_xmax,
+//		unsigned int 	*d_ymin,
+//		unsigned int 	*d_ymax,
+//		unsigned int 	*d_dnpix,
+//		unsigned int 	*d_npix,
+//		unsigned int	*d_peakx,
+//		unsigned int	*d_peaky,
+//
+//		float 		*d_bkg,
+//		float 		*d_dbkg,
+//		float		*d_sigbkg,
+//		float 		*d_a,
+//		float 		*d_b,
+//		float 		*d_cxx,
+//		float 		*d_cxy,
+//		float 		*d_cyy,
+//		float 		*d_theta,
+//		float 		*d_abcor,
+//		float		*d_peak,
+//		float 		*d_dpeak,
+//		float 		*d_fdpeak,
+//		float		*d_flux,
+//		float 		*d_dflux,
+//		float 		*d_fdflux,
+//		float		*d_fluxerr,
+//		float		*d_thresh,
+//		float		*d_mthresh,
+//		float		*d_fwhm,
+//
+//		double 		*d_mx,
+//		double 		*d_my,
+//		double 		*d_mx2,
+//		double 		*d_my2,
+//		double 		*d_mxy,
+//		double		*d_poserr_mx2,
+//		double		*d_poserr_my2,
+//		double		*d_poserr_mxy,
+//		char  		*d_singuflag,
+//		int			**d_iso,
+//		objstruct   *d_objectlist,
+//		int 		numobj)
+//{
+//	const int i = blockDim.x * blockIdx.x + threadIdx.x;
+//
+//	if(i >= numobj)
+//		return;
+//
+//	objstruct obj = d_objectlist[i];
+//
+//	obj.number = d_index[i];
+//
+//	obj.flag = d_flag[i];
+//	obj.fdnpix = d_fdnpix[i];
+//
+//	obj.dthresh = d_dthresh[i];
+//	obj.xmin = d_xmin[i];
+//	obj.xmax = d_xmax[i];
+//	obj.ymin = d_ymin[i];
+//	obj.ymax = d_ymax[i];
+//	obj.dnpix = d_dnpix[i];
+//	obj.npix = d_npix[i];
+//	obj.peakx = d_peakx[i];
+//	obj.peaky = d_peaky[i];
+//
+//	obj.bkg = d_bkg[i];
+//	obj.dbkg = d_dbkg[i];
+//	obj.sigbkg = d_sigbkg[i];
+//	obj.a = d_a[i];
+//	obj.b = d_b[i];
+//	obj.cxx = d_cxx[i];
+//	obj.cxy = d_cxy[i];
+//	obj.cyy = d_cyy[i];
+//	obj.theta = d_theta[i];
+//	obj.abcor = d_abcor[i];
+//	obj.peak = d_peak[i];
+//	obj.dpeak = d_dpeak[i];
+//	obj.fdpeak = d_fdpeak[i];
+//	obj.flux = d_flux[i];
+//	obj.dflux = d_dflux[i];
+//	obj.fdflux = d_fdflux[i];
+//	obj.fluxerr = d_fluxerr[i];
+//	obj.thresh = d_thresh[i];
+//	obj.mthresh = d_mthresh[i];
+//	obj.fwhm = d_fwhm[i];
+//
+//	obj.mx =d_mx[i];
+//	obj.my = d_my[i];
+//	obj.mx2 = d_mx2[i];
+//	obj.my2 = d_my2[i];
+//	obj.mxy = d_mxy[i];
+//	obj.poserr_mx2 = d_poserr_mx2[i];
+//	obj.poserr_my2 = d_poserr_my2[i];
+//	obj.poserr_mxy = d_poserr_mxy[i];
+//	obj.singuflag = d_singuflag[i];
+//
+//	for(int t=0; t<NISO; t++)
+//		obj.iso[t] = d_iso[t][i];
+//
+//}
+
+//iso memset 0 before use
+extern "C" void analyse_gpu(
+		double		flagobj_poserr_mx2,
+		int			flagobj_peakx,
+		int			flagobj_iso_0,
+		float		flagobj_fwhm,
+		/* field global vars */
+		float		backsig,
+		double		gain,
+		double		ngamma,
+		float		thresh,
+		float		dthresh,
+		double		satur_level,
+		/*	constant vars */
+		int			plistexist_var,
+		int			plistoff_var,
+		int			prefs_weightgain_flag,
+		int			prefs_ext_minarea,
+		int			prefs_clean_flag,
+		int			detect_type,
+		int 		nbackx,
+		int 		nbacky,
+		int			backw,
+		int			backh,
+		int			width,
+		int 		numobj)
+{
+	int grid = (numobj-1)/(MAX_THREADS_PER_BLK)+1;
+	int block = (MAX_THREADS_PER_BLK);
+
+	if(prefs_ext_minarea != EXT_MINAREA)
+		printf("config and macro definition do not match, please check!!!\n");
+
+	int **p_iso;
+	cudaMalloc((void**)&p_iso, NISO*sizeof(int*));
+	cudaMemcpy(p_iso, d_iso, NISO*sizeof(int*), cudaMemcpyHostToDevice);
+
+//	cudaEvent_t start, stop;
+//	float time;
+//	cudaEventCreate(&start);
+//	cudaEventCreate(&stop);
+//	cudaEventRecord(start, 0);
+
+	//d_iso copy and memset
+	analyse_kernel<<<grid, block>>>(
+			d_cuttedObjLabelArray,
+			d_cuttedObjIndexArray,
+			d_cuttedPixCountArray,
+			d_finalPixelIndexArray,
+			d_npix,
+			d_peakx,
+			d_peaky,
+			p_iso,
+			d_mean,
+			d_sigma,
+			d_cdPixArray,
+			d_pixelArray,
+			d_a,
+			d_b,
+			d_fdflux,
+			d_flux,
+			d_fluxerr,
+			d_peak,
+			d_bkg,
+			d_dbkg,
+			d_sigbkg,
+			d_mthresh,
+			d_thresh,
+			d_fwhm,
+			d_singuflag,
+			d_mx,
+			d_my,
+			d_poserr_mx2,
+			d_poserr_my2,
+			d_poserr_mxy,
+			/* flag object vars */
+			flagobj_poserr_mx2,
+			flagobj_peakx,
+			flagobj_iso_0,
+			flagobj_fwhm,
+			/* field global vars */
+			backsig,
+			gain,
+			ngamma,
+			thresh,
+			dthresh,
+			satur_level,
+			/*	constant vars */
+			plistexist_var,
+			plistoff_var,
+			prefs_weightgain_flag,
+			prefs_clean_flag,
+			detect_type,
+			nbackx,
+			nbacky,
+			backw,
+			backh,
+			width,
+			numobj);
+
+	dim3 grid1((width - 1) / SQUARE_BLK_WIDTH + 1,
+			(height - 1) / SQUARE_BLK_HEIGHT + 1);
+	dim3 block1(SQUARE_BLK_WIDTH, SQUARE_BLK_HEIGHT);
+
+	//we assume that afterwards the pixel list will not be used
+	removepixel_kernel<<<grid1, block1>>>(d_pixelArray, d_cdPixArray, global_dthresh, width, height);
+
+//	cudaEventRecord(stop, 0);
+//	cudaEventSynchronize(stop);
+//	cudaEventElapsedTime(&time, start, stop);
+//	cudaEventDestroy(start);
+//	cudaEventDestroy(stop);
+//
+//	printf("Time counsumed by analyse is: %f\n", time);
+}
+
+
+extern "C" void copyobjects(
+		unsigned int *h_index,
+		unsigned int *h_flag,
+		unsigned int *h_fdnpix,
+		float 		 *h_dthresh,
+
+		unsigned int *h_xmin,
+		unsigned int *h_xmax,
+		unsigned int *h_ymin ,
+		unsigned int *h_ymax,
+		unsigned int *h_dnpix,
+		unsigned int *h_npix,
+		unsigned int *h_peakx,
+		unsigned int *h_peaky ,
+
+		float 	*h_bkg,
+		float 	*h_dbkg ,
+		float	*h_sigbkg,
+		float 	*h_a,
+		float 	*h_b,
+		float 	*h_cxx,
+		float 	*h_cxy,
+		float 	*h_cyy,
+		float 	*h_theta,
+		float 	*h_abcor,
+		float	*h_peak,
+		float 	*h_dpeak,
+		float 	*h_fdpeak ,
+		float	*h_flux ,
+		float 	*h_dflux,
+		float 	*h_fdflux,
+		float	*h_fluxerr,
+		float	*h_thresh,
+		float	*h_mthresh,
+		float	*h_fwhm,
+
+		double 	*h_mx,
+		double 	*h_my,
+		double 	*h_mx2,
+		double 	*h_my2,
+		double 	*h_mxy,
+		double	*h_poserr_mx2 ,
+		double	*h_poserr_my2,
+		double	*h_poserr_mxy,
+		char  	*h_singuflag,
+		int		**h_iso,
+		int total)
+{
+	/*
+	objstruct *d_objectlist;
+	cudaMalloc((void**)&d_objectlist, total*sizeof(objstruct));
+
+	int grid = (total-1)/(MAX_THREADS_PER_BLK)+1;
+	int block = (MAX_THREADS_PER_BLK);
+
+	copyobj_kernel<<<grid, block>>>(
+			d_index,
+			d_flag,
+			d_fdnpix,
+			d_dthresh,
+			d_xmin,
+			d_xmax,
+			d_ymin,
+			d_ymax,
+			d_dnpix,
+			d_npix,
+			d_peakx,
+			d_peaky,
+
+			d_bkg,
+			d_dbkg,
+			d_sigbkg,
+			d_a,
+			d_b,
+			d_cxx,
+			d_cxy,
+			d_cyy,
+			d_theta,
+			d_abcor,
+			d_peak,
+			d_dpeak,
+			d_fdpeak,
+			d_flux,
+			d_dflux,
+			d_fdflux,
+			d_fluxerr,
+			d_thresh,
+			d_mthresh,
+			d_fwhm,
+			d_mx,
+			d_my,
+			d_mx2,
+			d_my2,
+			d_mxy,
+			d_poserr_mx2,
+			d_poserr_my2,
+			d_poserr_mxy,
+			d_singuflag,
+			d_iso,
+			d_objectlist,
+			total);
+
+	cudaMemcpy(h_objectlist, d_objectlist, total*sizeof(objstruct), cudaMemcpyDeviceToHost);
+	cudaFree(d_objectlist);
+	*/
+
+	cudaMemcpy(h_index,  d_index, total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_flag,   d_flag,  total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_fdnpix, d_fdnpix,total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_dthresh, d_dthresh,total*sizeof(float), cudaMemcpyDeviceToHost);
+
+	cudaMemcpy(h_xmin,	d_xmin,	total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_xmax,  d_xmax, total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_ymin, 	d_ymin,	total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_ymax,  d_ymax, total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_dnpix, d_dnpix,total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_npix, 	d_npix,	total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_peakx, d_peakx,total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_peaky, d_peaky,total*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+	cudaMemcpy(h_bkg, 	d_bkg,	total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_dbkg, 	d_dbkg,	total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_sigbkg,d_sigbkg,	total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_a, 	d_a,	total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_b, 	d_b,	total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_cxx, 	d_cxx,	total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_cxy, 	d_cxy,	total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_cyy, 	d_cyy,	total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_theta, d_theta,total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_abcor, d_abcor,total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_peak,  d_peak, total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_dpeak, d_dpeak, total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_fdpeak,d_fdpeak, total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_flux,	d_flux, total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_dflux,	d_dflux, total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_fdflux,	d_fdflux, total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_fluxerr,	d_fluxerr, total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_thresh,	d_thresh, total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_mthresh,	d_mthresh, total*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_fwhm,		d_fwhm, total*sizeof(float), cudaMemcpyDeviceToHost);
+
+	cudaMemcpy(h_mx,	d_mx, total*sizeof(double), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_my,	d_my, total*sizeof(double), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_mx2,	d_mx2, total*sizeof(double), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_my2,	d_my2, total*sizeof(double), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_mxy,	d_mxy, total*sizeof(double), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_poserr_mx2,	d_poserr_mx2, total*sizeof(double), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_poserr_my2,	d_poserr_my2, total*sizeof(double), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_poserr_mxy,	d_poserr_mxy, total*sizeof(double), cudaMemcpyDeviceToHost);
+
+	cudaMemcpy(h_singuflag,	d_singuflag, total*sizeof(char), cudaMemcpyDeviceToHost);
+
+	for(int i=0; i<NISO; i++)
+		cudaMemcpy(h_iso[i],d_iso[i], total*sizeof(int), cudaMemcpyDeviceToHost);
+	//for(int i=0; i<200; i++)
+	//	printf("h_mx and h_my is %f, %f\n", h_mx[i]+1.0, h_my[i]+1.0);
+
+}

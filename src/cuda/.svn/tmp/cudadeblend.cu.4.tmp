@@ -1,0 +1,1820 @@
+/*
+ * cudadeblend.cu
+ *
+ *  Created on: 9 Jan, 2013
+ *      Author: zhao
+ */
+#include <stdio.h>
+#include <cuda.h>
+#include <limits.h>
+#include <cudpp.h>
+#include <iostream>
+#include <helper_cuda.h>
+#include "cudatypes.h"
+
+float	*d_multiThreshArray;
+//for the whole image label of lower threshold
+int		*d_rootLabelArray;
+
+unsigned int	**d_debPixelCountArray;
+unsigned int	**d_debXminArray;
+unsigned int	**d_debXmaxArray;
+unsigned int	**d_debYminArray;
+unsigned int	**d_debYmaxArray;
+float			**d_debFdpeakArray;
+float			**d_debDpeakArray;
+float			**d_debFdfluxArray;
+float			**d_debDthresh;
+int				**d_debFlagArray;
+int				**d_debOk;
+unsigned int	**d_debParentLabel;
+
+unsigned int	**d_finalDebLabelArray;
+unsigned int	**d_finalDebPixelIndexArray;
+unsigned int	**d_finalDebObjIndexArray;
+
+size_t			*h_finalValidObj;
+size_t			*h_finalValidPix;
+<<<<<<< .mine
+
+=======
+
+//int* d_son;
+//int* d_ok;
+>>>>>>> .r29
+///////////////////////////
+
+void compact_and_sort(int numPixAboveThresh, int level);
+
+size_t pre_analyse1(size_t compactedArraysize,
+		size_t deb_maxarea,
+		size_t* numValidObj,
+		int level);
+void cut_branch(int level, double mincount);
+
+
+__global__ void segmentMaskInitKernel(unsigned int* d_compactedLabelArray,
+		unsigned int* d_segmentMask, unsigned int numElements);
+
+__global__ void getPixelFromIndexKernel(unsigned int* d_indexArray,
+		float* d_inpixelArray, float* d_outpixelArray, size_t numElements);
+
+__global__ void pixelCountMaskInitKernel(unsigned int* d_pixelCountMask,
+		size_t numElements);
+
+__global__ void xyposFromIndexKernel(unsigned int* d_indexArray,
+		unsigned int* d_xposSegment,
+		unsigned int* d_yposSegment,
+		size_t numElements,
+		int width);
+
+__global__ void segmentmask_prune_kernel(
+		unsigned int* d_compactedLabelArray,
+		unsigned int* d_segmentEndMask,
+		unsigned int* d_pixelCountSegment,
+		size_t numElements,
+		size_t ext_minarea);
+
+__global__ void checkTruncKernel(unsigned int* d_xminArray,
+		unsigned int *d_xmaxArray,
+		unsigned int *d_yminArray,
+		unsigned int *d_ymaxArray,
+		int			 *d_flagArray,
+		unsigned int h_numValidObj,
+		unsigned int maxwidth,
+		unsigned int maxheight);
+
+__global__ void okInit_kernel(int *d_ok, unsigned int h_numValidObj);
+
+__global__ void getLabelFromIndexKernel(unsigned int* d_indexArray,
+		int* d_labelArrayIn,
+		unsigned int* d_labelArrayOut,
+		size_t numElements);
+
+void checkcudppSuccess(CUDPPResult res, char* msg);
+
+//////////////////////////////////////////////////////////
+__global__ void rootLabelInitKernel(int* d_rootLabelArray,
+		unsigned int* d_finalCompactedLabelArray,
+		unsigned int* d_finalCompactedIndexArray,
+		unsigned int  numValidPix) {
+
+	const int tid_x = blockDim.x * blockIdx.x + threadIdx.x;
+	const int tid_y = blockDim.y * blockIdx.y + threadIdx.y;
+	const int tid = tid_y * (gridDim.x * blockDim.x) + tid_x;
+
+	if(tid < numValidPix) {
+		d_rootLabelArray[d_finalCompactedIndexArray[tid]]
+		                    = d_finalCompactedLabelArray[tid];
+	}
+}
+
+__global__ void computeMultiThreshKernel(float* _d_multiThreshArray,
+		float*	_d_fdpeakArray,
+		float _base_thresh,
+		int _deblend_nthresh,
+		unsigned int  numValidObj) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid >= numValidObj)
+		return;
+
+	double dthresh0 = _base_thresh;
+	double dthresh = _d_fdpeakArray[tid];
+
+	for(int i=1; i<_deblend_nthresh; i++) {
+		_d_multiThreshArray[numValidObj * (i-1) + tid] =
+<<<<<<< .mine
+				 dthresh0 * pow(dthresh/dthresh0,(double)i/_deblend_nthresh);
+=======
+				_base_thresh * pow((float)(_d_fdpeakArray[tid] / _base_thresh),
+						(float)i/_deblend_nthresh);
+>>>>>>> .r29
+	}
+}
+
+//n=31
+//deblend_nthresh 32
+//kernel shape: 4096 blocks, 32x32 threads per block
+//0.105s
+__global__ void deblendInit_kernel(float *d_cdPixArray,
+		int *d_labelArray,
+		int *d_equivArray,
+		unsigned int *d_compactMask,
+		unsigned int *d_compactedIndexArray,
+		int *d_rootLabelArray,
+		float* 	d_multiThreshArray,
+		int numValidObj,
+		int numValidPix,
+		int n) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid < numValidPix) {
+
+		int id = d_compactedIndexArray[tid];
+		int rootlabel = d_rootLabelArray[id];
+
+		//parent label: 1,2,....
+		//float thresh = d_multiThreshArray[(deblend_nthresh-1)*(rootlabel-1)+(n-1)];
+		float thresh = d_multiThreshArray[(n-1)*numValidObj+ rootlabel-1];
+
+		if(d_cdPixArray[id] >= thresh)
+		{
+			d_labelArray[id] = id;
+			d_equivArray[id] = id;
+			d_compactMask[tid]= 1;
+		}
+		/*
+		else
+		{
+			d_labelArray[id] = -1;
+			d_equivArray[id] = -1;
+			d_compactMask[tid]= 0;
+		}*/
+	}
+}
+
+__global__ void debcompactMaskInitKernel(int* d_labelArray,
+		unsigned int* d_compactMask,
+		int numValidPix) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid < numValidPix) {
+
+		if (d_labelArray[tid] == -1)
+			d_compactMask[tid] = 0;
+		else
+			d_compactMask[tid] = 1;
+	}
+}
+
+__global__ void scanKernel1(int* d_labelArray,
+		int* d_equivArray,
+		unsigned int* d_compactedIndexArray,
+		int numValidPix,
+		int width,
+		int height,
+		int* update) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid >= numValidPix)
+		return;
+
+	int id = d_compactedIndexArray[tid];
+
+	int neighbors[8];
+	int label1 = d_labelArray[id];
+	int label2 = INT_MAX;
+	if (label1 == -1)
+		return;
+
+	int id_x = id % width;
+	int id_y = id / width;
+
+	//the edge labels are  considered
+	if (id_y > 0) {
+		if (id_x > 0)
+			neighbors[0] = d_labelArray[(id_y - 1) * width + (id_x - 1)];
+		else
+			neighbors[0] = -1;
+
+		neighbors[1] = d_labelArray[(id_y - 1) * width + (id_x)];
+
+		if (id_x < width - 1)
+			neighbors[2] = d_labelArray[(id_y - 1) * width + (id_x + 1)];
+		else
+			neighbors[2] = -1;
+
+	} else {
+		neighbors[0] = -1;
+		neighbors[1] = -1;
+		neighbors[2] = -1;
+	}
+
+	if (id_x > 0)
+		neighbors[3] = d_labelArray[(id_y) * width + (id_x - 1)];
+	else
+		neighbors[3] = -1;
+
+	if (id_x < width - 1)
+		neighbors[4] = d_labelArray[(id_y) * width + (id_x + 1)];
+	else
+		neighbors[4] = -1;
+
+	if (id_y < (height - 1)) {
+		if (id_x > 0)
+			neighbors[5] = d_labelArray[(id_y + 1) * width + (id_x - 1)];
+		else
+			neighbors[5] = -1;
+
+		neighbors[6] = d_labelArray[(id_y + 1) * width + (id_x)];
+
+		if (id_x < width - 1)
+			neighbors[7] = d_labelArray[(id_y + 1) * width + (id_x + 1)];
+		else
+			neighbors[7] = -1;
+	} else {
+		neighbors[5] = -1;
+		neighbors[6] = -1;
+		neighbors[7] = -1;
+	}
+
+	for (int i = 0; i < 8; i++) {
+		if ((neighbors[i] != -1) && (neighbors[i] < label2)) {
+			label2 = neighbors[i];
+		}
+	}
+	if (label2 < label1) {
+		atomicMin(d_equivArray + label1, label2);
+		//d_equivArray[tid] = label2;
+		*update = 1;
+	}
+	return;
+}
+
+__global__ void analysisKernel1(int* d_labelArray,
+		int* d_equivArray,
+		unsigned int* d_compactedIndexArray,
+		int numValidPix) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid < numValidPix) {
+
+		int id = d_compactedIndexArray[tid];
+
+		int ref = d_equivArray[id];
+		while (ref != -1 && ref != d_equivArray[ref]) {
+			ref = d_equivArray[ref];
+		}
+		d_equivArray[id] = ref;
+		d_labelArray[id] = ref;
+	}
+
+}
+
+__global__ void labellingKernek1(int* d_labelArray,
+		int* d_equivArray,
+		unsigned int* d_compactedIndexArray,
+		int numValidPix) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid < numValidPix) {
+		int id = d_compactedIndexArray[tid];
+		//d_labelArray[id] = d_equivArray[d_labelArray[id]];
+		d_labelArray[id] = d_equivArray[id];
+	}
+}
+
+//needed to be improved later on.
+/**
+ * initialize the dthresh value
+ */
+__global__ void debDthreshInit_kernel(float *d_debDthresh,
+		unsigned int 	*d_finalDebObjIndexArray,
+		unsigned int 	*d_finalDebPixelIndexArray,
+		int 			*d_rootLabelArray,
+		float 			*d_multiThreshArray,
+		int 			level,
+		unsigned int 	h_numValidObj,
+		int				h_rootnumValidObj) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid < h_numValidObj)
+	{
+		unsigned int first_index = d_finalDebPixelIndexArray[d_finalDebObjIndexArray[tid]];
+		int rootlabel = d_rootLabelArray[first_index];
+		d_debDthresh[tid] = d_multiThreshArray[(level-1)*h_rootnumValidObj + rootlabel-1];
+	}
+}
+
+//compute obj.fdflux - obj.dthresh*obj.fdnpix(in original order produced by analysis)
+//value0 = objlist[0].obj[0].fdflux*prefs.deblend_mincont;
+//need to be improved later on
+__global__ void decidePrune1_kernel(
+		unsigned int 	*d_flag,
+		unsigned int 	*d_nson,
+		float 			*d_fdflux,
+		float			*d_dthresh,
+		unsigned int 	*d_fdnpix,
+		unsigned int	*d_finalDebPixelIndexArray,
+		unsigned int	*d_finalDebObjIndexArray,
+		int				*d_ok,
+		int				*d_parentOk,
+		unsigned int	*d_parentLabel,
+		int				*d_rootLabelArray,
+		float			*d_rootfdflux,
+		unsigned int 	h_numValidObj,
+		double 			deblend_mincont) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid < h_numValidObj) {
+
+<<<<<<< .mine
+		//if(d_nson[tid] > 1)
+		//	d_ok[tid] = 0;
+
+=======
+		if(d_nson[tid] > 1)
+			d_ok[tid] = 0;
+
+>>>>>>> .r29
+		int parentlabel = d_parentLabel[tid];
+		atomicAnd(d_parentOk + (parentlabel-1), d_ok[tid]);
+
+		unsigned int first_index = d_finalDebPixelIndexArray[d_finalDebObjIndexArray[tid]];
+		int rootlabel = d_rootLabelArray[first_index];
+		double value0 = d_rootfdflux[rootlabel-1] * deblend_mincont;
+
+		if(d_fdflux[tid] - d_dthresh[tid]*d_fdnpix[tid] > value0)
+		{
+			d_flag[tid] = 1;
+			atomicAdd(d_nson+(parentlabel-1), 1);
+		}
+		else
+			d_flag[tid] = 0;
+	}
+}
+
+/*
+__global__ void decidePrune1_kernel1(
+		unsigned int 	*d_flag,
+		unsigned int 	*d_nson,
+		double 			*d_fdflux,
+		float			*d_dthresh,
+		unsigned int 	*d_fdnpix,
+		unsigned int	*d_finalDebPixelIndexArray,
+		unsigned int	*d_finalDebObjIndexArray,
+		int				*d_ok,
+		int				*d_parentOk,
+		unsigned int	*d_parentLabel,
+		int				*d_rootLabelArray,
+		float			*d_rootfdflux,
+		unsigned int 	h_numValidObj,
+		double 			deblend_mincont) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid < h_numValidObj) {
+
+		if(d_nson[tid] > 1)
+			d_ok[tid] = 0;
+
+		int parentlabel = d_parentLabel[tid];
+		atomicAnd(d_parentOk + (parentlabel-1), d_ok[tid]);
+
+		unsigned int first_index = d_finalDebPixelIndexArray[d_finalDebObjIndexArray[tid]];
+		int rootlabel = d_rootLabelArray[first_index];
+		double value0 = d_rootfdflux[rootlabel-1] * deblend_mincont;
+
+		if(d_fdflux[tid] - d_dthresh[tid]*d_fdnpix[tid] > value0)
+		{
+			d_flag[tid] = 1;
+			atomicAdd(d_nson+(parentlabel-1), 1);
+		}
+		else
+			d_flag[tid] = 0;
+	}
+}*/
+
+__global__ void decidePrune2_kernel(unsigned int *d_flag,
+		unsigned int *d_nson,
+		int			 *d_ok,
+		int			 *d_parentOk,
+		unsigned int *d_parentLabel,
+		unsigned int h_numValidObj) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid < h_numValidObj) {
+
+		int nson = d_nson[d_parentLabel[tid]-1];
+<<<<<<< .mine
+
+		if(nson > 1)
+			d_parentOk[d_parentLabel[tid]-1] = 0;
+
+=======
+
+>>>>>>> .r29
+		if(nson > 1 && d_ok[tid] == 1 && d_flag[tid] == 1)
+			d_flag[tid] = 1;
+		else
+			d_flag[tid] = 0;
+	}
+}
+
+__global__ void decidePrune3_kernel(
+		unsigned int h_numValidObj) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid < h_numValidObj) {
+
+	}
+}
+
+__global__ void cuttinglabelInit_kernel(unsigned int *d_label, unsigned int h_numValidObj) {
+
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+	if(tid < h_numValidObj)
+		d_label[tid] = 1;
+}
+
+void computefdflux(float *d_fdfluxArray,
+		float *d_compactedcdPixelArray,
+		unsigned int *d_segmentMask,
+		size_t compactedArraysize)
+{
+	float *pixelArray = (float*)malloc(compactedArraysize*sizeof(float));
+	unsigned int *segmentmask = (unsigned int*)malloc(compactedArraysize*sizeof(unsigned int));
+	float *fdflux = (float*)malloc(compactedArraysize*sizeof(float));
+	float *fdfluxArray = (float*)malloc(compactedArraysize*sizeof(float));
+
+	cudaMemcpy(pixelArray, d_compactedcdPixelArray, compactedArraysize*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(segmentmask, d_segmentMask, compactedArraysize*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	//cudaMemcpy(fdflux, d_fdfluxSegment, compactedArraysize*sizeof(float), cudaMemcpyDeviceToHost);
+
+	float fd = 0;
+	int count=0;
+	for(int i=compactedArraysize-1; i>=0; i--)
+	{
+		fd += pixelArray[i];
+		fdflux[i] = fd;
+
+		if(segmentmask[i] == 1)
+		{
+			fd = 0;
+			count++;
+		}
+	}
+
+	cudaMalloc((void**)&d_fdfluxArray, count*sizeof(float));
+
+	int j=0;
+	for(int i=0; i<compactedArraysize; i++)
+	{
+		if(segmentmask[i] == 1)
+			fdfluxArray[j++] = fdflux[i];
+	}
+
+	cudaMemcpy(d_fdfluxArray, fdfluxArray, count*sizeof(float), cudaMemcpyHostToDevice);
+
+	free(pixelArray);
+	free(segmentmask);
+	free(fdflux);
+	//free(fdflux1);
+}
+
+
+__global__ void copypixel(float *d_compactedcdPixelArray, double *compactedPix, unsigned int h_numValidObj)
+{
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+	if(tid < h_numValidObj)
+	{
+			compactedPix[tid] = d_compactedcdPixelArray[tid];
+	}
+}
+//cut_firstscan<<<grid_obj, block_obj>>>(d_fdflux, d_dthresh, d_fdnpix, );
+//////////////////////////////////////////////////////////////////////////
+/**
+ * allocated global vars:d_multiThreshArray
+ * 						 d_rootLabelArray
+ */
+extern "C" void init_deblend(float basethresh,
+		int _deblend_nthresh,
+		size_t numValidObj,
+		size_t numValidPix) {
+
+	int grid_obj = (((int)numValidObj-1)/(MAX_THREADS_PER_BLK)+1);
+	int block_obj = (MAX_THREADS_PER_BLK);
+
+	int grid_pix = (((int)numValidPix-1)/(MAX_THREADS_PER_BLK)+1);
+	int block_pix = (MAX_THREADS_PER_BLK);
+
+	checkCudaErrors(cudaMalloc((void**)(&d_multiThreshArray),
+			numValidObj*(_deblend_nthresh-1)*sizeof(float)));
+	checkCudaErrors(cudaMalloc((void**)(&d_rootLabelArray), width*height * sizeof(int)));
+	checkCudaErrors(cudaMemset(d_rootLabelArray, -1, width * height * sizeof(int)));
+
+	computeMultiThreshKernel<<<grid_obj, block_obj>>>(d_multiThreshArray,
+			d_fdpeakArray,
+			basethresh,
+			_deblend_nthresh,
+			numValidObj);
+
+	rootLabelInitKernel<<<grid_pix, block_pix>>>(d_rootLabelArray,
+			d_finalLabelArray,
+			d_finalPixelIndexArray,
+			numValidPix);
+
+	/*
+	d_compactedDebLabelArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+	d_compactedDebIndexArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+	d_compactedDebPixelArray = (float**)malloc(_deblend_nthresh*sizeof(float*));
+	d_compactedDebCdPixelArray = (float**)malloc(_deblend_nthresh*sizeof(float*));
+	d_segmentDebMask = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+	d_compactedDebParentLabel =(unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));*/
+
+	d_debPixelCountArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+	d_debXminArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+	d_debXmaxArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+	d_debYminArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+	d_debYmaxArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+
+	d_debFdpeakArray = (float**)malloc(_deblend_nthresh*sizeof(float*));
+	d_debDpeakArray = (float**)malloc(_deblend_nthresh*sizeof(float*));
+	d_debFdfluxArray = (float**)malloc(_deblend_nthresh*sizeof(float*));
+	d_debDthresh = (float**)malloc(_deblend_nthresh*sizeof(float*));
+
+	d_debFlagArray = (int**)malloc(_deblend_nthresh*sizeof(int*));
+	d_debOk = (int**)malloc(_deblend_nthresh*sizeof(int*));
+	d_debParentLabel = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+
+	d_finalDebPixelIndexArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+	d_finalDebObjIndexArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+	d_finalDebLabelArray = (unsigned int**)malloc(_deblend_nthresh*sizeof(unsigned int*));
+}
+
+void init_level0() {
+
+	d_debPixelCountArray[0] = d_pixelCountArray;
+	d_debXminArray[0]		= d_xminArray;
+	d_debXmaxArray[0]		= d_xmaxArray;
+	d_debYminArray[0]		= d_yminArray;
+	d_debYmaxArray[0]		= d_ymaxArray;
+	d_debFdpeakArray[0]		= d_fdpeakArray;
+	d_debDpeakArray[0]		= d_dpeakArray;
+	d_debFdfluxArray[0]		= d_fdfluxArray;
+	d_debDthresh[0]			= d_dthresh;
+
+	d_debFlagArray[0]		= d_flagArray;
+	d_debOk[0]				= d_ok;
+
+	d_debParentLabel[0]		= NULL;
+
+	d_finalDebLabelArray[0] = d_finalLabelArray;
+	d_finalDebPixelIndexArray[0] = d_finalPixelIndexArray;
+	d_finalDebObjIndexArray[0] = d_finalObjIndexArray;
+
+}
+//d_labelArray has been changed here
+/**
+ * allocated global vars: d_compactedDebIndexArray
+ */
+extern "C" void parcel_out(float basethresh,
+		int n_thresh,
+		int deb_minarea,
+		size_t numValidObj,
+		size_t numValidPix,
+		double deblend_mincont) {
+
+	cudaEvent_t start, stop;
+	float time, totaltime=0.0;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	////////////////////////////////////////
+
+	int 		*d_update;
+	int 		*h_update;
+	size_t	 	h_numPixAboveThresh;
+
+	dim3 grid((width - 1) / SQUARE_BLK_WIDTH + 1,
+			 (height - 1) / SQUARE_BLK_HEIGHT + 1);
+	dim3 block(SQUARE_BLK_WIDTH, SQUARE_BLK_HEIGHT);
+
+	checkCudaErrors(cudaMalloc((void**)(&d_update), sizeof(int)));
+
+	h_update = (int*) malloc(sizeof(int));
+	h_finalValidObj = (size_t*) malloc(n_thresh*sizeof(size_t));
+	h_finalValidPix = (size_t*) malloc(n_thresh*sizeof(size_t));
+
+	h_finalValidObj[0] = numValidObj;
+	h_finalValidPix[0] = numValidPix;
+
+	init_level0();
+	////////////////////////////////
+
+	cudaEventRecord(start, 0);
+
+	for(int i=1; i<n_thresh; i++) {
+
+		//can also be initialized by kernel with size h_finalValidPix[0]
+		checkCudaErrors(cudaMemset(d_labelArray, -1, width * height * sizeof(int)));
+		checkCudaErrors(cudaMemset(d_equivArray, -1, width * height * sizeof(int)));
+		//width * height was replaced with (int)h_finalValidPix[i-1]
+		checkCudaErrors(cudaMemset(d_compactMask, 0, (int)h_finalValidPix[i-1] * sizeof(unsigned int)));
+
+		int grid_pix = (((int)h_finalValidPix[i-1]-1)/(MAX_THREADS_PER_BLK)+1);
+		int block_pix = (MAX_THREADS_PER_BLK);
+
+		deblendInit_kernel<<<grid_pix, block_pix>>>(d_cdPixArray,
+				d_labelArray,
+				d_equivArray,
+				d_compactMask,
+				d_finalDebPixelIndexArray[i-1],
+				d_rootLabelArray,
+				d_multiThreshArray,
+				h_finalValidObj[0],
+				h_finalValidPix[i-1],
+				i);
+
+		CUDPPResult res;
+
+		////////////////////////////////////
+		//compact the index array(also label array before detection)
+
+		//create the configuration for compact
+		//CUDPPConfiguration compactconfig;
+		config.datatype = CUDPP_INT;
+		config.algorithm = CUDPP_COMPACT;
+
+		//create the cudpp compact plan
+		//CUDPPHandle compact;
+		res = cudppPlan(theCudpp, &compactplan, config, (int)h_finalValidPix[i-1], 1, 0);
+		if (CUDPP_SUCCESS != res)
+		{
+			printf("Error creating CUDPP compact Plan in %s at line %d\n", __FILE__, __LINE__);
+			exit(-1);
+		}
+
+		// Run the compact for index array
+		res = cudppCompact(compactplan, d_compactedIndexArray, d_numPixAboveThresh,
+				d_finalDebPixelIndexArray[i-1],
+				d_compactMask,
+				(int)h_finalValidPix[i-1]);
+		if (CUDPP_SUCCESS != res)
+		{
+			printf("Error running CUDPP compact in %s at line %d\n", __FILE__, __LINE__);
+			exit(-1);
+		}
+
+		//Run the compact for parent label array
+		res = cudppCompact(compactplan, d_compactedParentLabel, d_numPixAboveThresh,
+				d_finalDebLabelArray[i-1],
+				d_compactMask,
+				(int)h_finalValidPix[i-1]);
+		if (CUDPP_SUCCESS != res)
+		{
+			printf("Error running CUDPP compact in %s at line %d\n", __FILE__, __LINE__);
+			exit(-1);
+		}
+
+		// Destroy the int compact plan
+		res = cudppDestroyPlan(compactplan);
+		checkcudppSuccess(res, "Error destroying CUDPP compact Plan");
+
+		cudaMemcpy(&h_numPixAboveThresh, d_numPixAboveThresh, sizeof(size_t), cudaMemcpyDeviceToHost);
+		/////////////////////////////////////////////
+		//end of compact
+
+		int count = 0;
+		int detection_grid = ((int)h_numPixAboveThresh-1)/(MAX_THREADS_PER_BLK)+1;
+		int detection_block = (MAX_THREADS_PER_BLK);
+
+		//printf("numpix above thresh at level %d is %d\n", i, h_numPixAboveThresh);
+
+		while(1) {
+			*h_update = 0;
+			cudaMemcpy(d_update, h_update, sizeof(int), cudaMemcpyHostToDevice);
+			scanKernel1<<<detection_grid, detection_block>>>(d_labelArray,
+					d_equivArray,
+					d_compactedIndexArray,
+					h_numPixAboveThresh,
+					width,
+					height,
+					d_update);
+
+			analysisKernel1<<<detection_grid, detection_block>>>(d_labelArray,
+					d_equivArray,
+					d_compactedIndexArray,
+					h_numPixAboveThresh);
+
+			/*labellingKernek1<<<detection_grid, detection_block>>>(d_labelArray,
+					d_equivArray,
+					d_compactedIndexArray,
+					h_numPixAboveThresh);*/
+
+//			cudaMemcpy(d_labelArray, d_equivArray, width*height*sizeof(int), cudaMemcpyDeviceToDevice);
+			cudaMemcpy(h_update, d_update, sizeof(int), cudaMemcpyDeviceToHost);
+			count++;
+
+			if(!(*h_update))
+				break;
+		}
+
+		compact_and_sort((int)h_numPixAboveThresh, i);
+		h_finalValidPix[i] = pre_analyse1(h_numPixAboveThresh, deb_minarea, &h_finalValidObj[i], i);
+
+		//printf("level %d, h_finalValidPix is %d, h_finalValidObj is %d\n", i, (int)h_finalValidPix[i], (int)h_finalValidObj[i]);
+	}
+
+	for(int i=n_thresh-1; i>=1; i--) {
+
+		cut_branch(i, 0.0005);
+	}
+
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&time, start, stop);
+	//totaltime += time;
+
+	/////////////////////////////////////////////////////////////
+	checkCudaErrors(cudaFree(d_update));
+
+	free(h_update);
+	free(h_finalValidObj);
+	free(h_finalValidPix);
+
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+	printf("Time counsumed by deblend detection is: %f\n", time/1000);
+	//////////////
+}
+
+/**
+ * allocated global vars: d_compactedDebLabelArray[level],
+ * 						  d_compactedDebPixelArray[level],
+ * 						  d_compactedDebCdPixelArray[level]
+ * 						  d_segmentDebMask[level]
+ */
+void compact_and_sort1(int numpix, int level) {
+
+	CUDPPResult res;
+
+	int grid = (numpix-1)/(MAX_THREADS_PER_BLK)+1;
+	int block = (MAX_THREADS_PER_BLK);
+
+	//checkCudaErrors(cudaMalloc( (void**) &d_compactedDebLabelArray[level], numPixAboveThresh * sizeof(unsigned int)));
+
+	getLabelFromIndexKernel<<<grid, block>>>(d_compactedIndexArray,
+			d_labelArray,
+			d_compactedLabelArray,
+			numpix);
+
+	////////////////////////////////////////////
+	// Create the configuration for sort
+	//CUDPPConfiguration sort_config;
+	config.datatype = CUDPP_INT;
+	config.algorithm = CUDPP_SORT_RADIX;
+	config.options = CUDPP_OPTION_KEY_VALUE_PAIRS;
+
+	//create the cudpp sort plan
+	//CUDPPHandle sortplan = 0;
+	res = cudppPlan(theCudpp, &sortplan, config, numpix, 1, 0);
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error creating CUDPP sort Plan in %s at line %d\n", __FILE__, __LINE__);
+		exit(-1);
+	}
+
+	// Run the sort
+	res = cudppSort(sortplan, d_compactedLabelArray, d_compactedIndexArray, numpix);
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error in cudppSort() for sorting compacted labels in %s at line %d\n", __FILE__, __LINE__);
+		exit(-1);
+	}
+
+	/*
+	res = cudppSort(sortplan, d_compactedLabelArray, d_compactedParentLabel, (int)numPixAboveThresh);
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error in cudppSort() for sorting compacted labels in %s at line %d\n", __FILE__, __LINE__);
+		exit(-1);
+	}*/
+
+	// Destroy the sort plan
+	res = cudppDestroyPlan(sortplan);
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error destroying CUDPP sort Plan in %s at line %d\n", __FILE__, __LINE__);
+		exit(-1);
+	}
+
+	//initialize the segment mask array according to the compacted label array.
+	//(1 for the start pos of a segment, 0 otherwise)
+	segmentMaskInitKernel<<<grid, block>>>(d_compactedLabelArray,
+			d_segmentMask, numpix);
+
+	//initialize the compacted pixel array according to the original pixel array
+	//and the compacted index array.
+	getPixelFromIndexKernel<<<grid, block>>>(d_compactedIndexArray,
+			d_pixelArray, d_compactedPixelArray, numpix);
+
+	//initialize the compacted cd pixel array according to the original pixel array
+	//and the compacted index array.
+	getPixelFromIndexKernel<<<grid, block>>>(d_compactedIndexArray,
+			d_cdPixArray, d_compactedcdPixelArray, numpix);
+
+	//////////////////////////////////////////////////////////////////////
+}
+
+/**
+ *  allocated but not freed global array in this method:
+ *	d_debPixelCountArray (d_deb***Array totally 10)
+ *	d_finalDebPixelIndexArray
+ *	d_finalDebObjIndexArray
+ *	d_finalDebLabelArray
+ *	d_debParentLabel
+ *
+ *	deleted global vars:
+ *
+ *	d_compactedDebIndexArray
+	d_compactedDebLabelArray
+	d_compactedDebPixelArray
+	d_compactedDebCdPixelArray
+	d_segmentDebMask
+	d_compactedDebParentLabel
+ */
+size_t pre_analyse1(size_t compactedArraysize,
+		size_t deb_maxarea,
+		size_t* numValidObj,
+		int level) {
+
+	//reserved space to place the final result for pre-analysis
+	//one elements for each objects
+	static unsigned int	*d_numValidObj;
+	unsigned int	h_numValidObj;
+
+	static unsigned int	*d_numValidPix;
+	unsigned int  	h_numValidPix;
+
+	static size_t		*d_numCompactedObj;
+	static size_t		*d_numCompactedPix;
+
+	////////////////////////////////////////////////////
+
+	//initialize all the elements in d_pixelCountMask
+	int grid1 = ((int)compactedArraysize-1)/(MAX_THREADS_PER_BLK)+1;
+	int block1 = (MAX_THREADS_PER_BLK);
+	pixelCountMaskInitKernel<<<grid1, block1>>>(d_pixelCountMask, compactedArraysize);
+
+	xyposFromIndexKernel<<<grid1, block1>>>(d_compactedIndexArray,
+			d_xposSegment,
+			d_yposSegment,
+			compactedArraysize,
+			width);
+
+	//////////////////////////////////////////////
+	//create prefix scan configuration
+	CUDPPConfiguration scanconfig;
+	scanconfig.op = CUDPP_ADD;
+	scanconfig.datatype = CUDPP_UINT;
+	scanconfig.algorithm = CUDPP_SEGMENTED_SCAN;
+	scanconfig.options = CUDPP_OPTION_BACKWARD | CUDPP_OPTION_INCLUSIVE;
+
+	//create segment prefix scan plan
+	//CUDPPHandle scanplan = 0;
+	CUDPPResult res = cudppPlan(theCudpp, &scanplan, scanconfig, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP segment mask array scan Plan");
+
+	res = cudppSegmentedScan(scanplan,
+			d_pixelCountSegment,
+			d_pixelCountMask,
+			d_segmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the segment pixel count scan");
+
+	// Destroy the segment prefix scan plan
+	res = cudppDestroyPlan(scanplan);
+	checkcudppSuccess(res, "Error destroying CUDPP segment pixel count scan Plan");
+
+	//////////////////////////////////////////////
+	//create max scan configuration
+
+	scanconfig.op = CUDPP_MAX;
+	scanconfig.datatype = CUDPP_UINT;
+	scanconfig.algorithm = CUDPP_SEGMENTED_SCAN;
+	scanconfig.options = CUDPP_OPTION_BACKWARD | CUDPP_OPTION_INCLUSIVE;
+
+	res = cudppPlan(theCudpp, &scanplan, scanconfig, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP segment max scan Plan");
+
+	res = cudppSegmentedScan(scanplan,
+			d_xmaxSegment,
+			d_xposSegment,
+			d_segmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the segment x max scan");
+
+	res = cudppSegmentedScan(scanplan,
+			d_ymaxSegment,
+			d_yposSegment,
+			d_segmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the segment y max scan");
+
+	// Destroy the segment prefix scan plan
+	res = cudppDestroyPlan(scanplan);
+	checkcudppSuccess(res, "Error destroying CUDPP segment max scan Plan");
+
+	//////////////////////////////////////////////
+	//create min scan configuration
+	scanconfig.op = CUDPP_MIN;
+	scanconfig.datatype = CUDPP_UINT;
+	scanconfig.algorithm = CUDPP_SEGMENTED_SCAN;
+	scanconfig.options = CUDPP_OPTION_BACKWARD | CUDPP_OPTION_INCLUSIVE;
+
+	res = cudppPlan(theCudpp, &scanplan, scanconfig, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP segment min scan Plan");
+
+	res = cudppSegmentedScan(scanplan,
+			d_xminSegment,
+			d_xposSegment,
+			d_segmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the segment x min scan");
+
+	res = cudppSegmentedScan(scanplan,
+			d_yminSegment,
+			d_yposSegment,
+			d_segmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the segment y min scan");
+
+	// Destroy the segment prefix scan plan
+	res = cudppDestroyPlan(scanplan);
+	checkcudppSuccess(res, "Error destroying CUDPP segment min scan Plan");
+
+	////////////////////////////////////////////////////
+	//create float max scan configuration(for fdpeak and dpeak).
+	scanconfig.op = CUDPP_MAX;
+	scanconfig.datatype = CUDPP_FLOAT;
+	scanconfig.algorithm = CUDPP_SEGMENTED_SCAN;
+
+	res = cudppPlan(theCudpp, &scanplan, scanconfig, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP segment float max scan Plan");
+
+	res = cudppSegmentedScan(scanplan,
+			d_fdpeakSegment,
+			d_compactedcdPixelArray,
+			d_segmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the segment fdpeak scan");
+
+	res = cudppSegmentedScan(scanplan,
+			d_dpeakSegment,
+			d_compactedPixelArray,
+			d_segmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the segment dpeak scan");
+
+	// Destroy the segment prefix scan plan
+	res = cudppDestroyPlan(scanplan);
+	checkcudppSuccess(res, "Error destroying CUDPP segment float max scan Plan");
+
+	////////////////////////////////////////////////////
+	//create float sum scan configuration(for fdflux).
+	scanconfig.op = CUDPP_ADD;
+	scanconfig.datatype = CUDPP_FLOAT;
+	scanconfig.algorithm = CUDPP_SEGMENTED_SCAN;
+	scanconfig.options = CUDPP_OPTION_BACKWARD | CUDPP_OPTION_INCLUSIVE;
+
+	res = cudppPlan(theCudpp, &scanplan, scanconfig, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP segment float sum scan Plan");
+
+	res = cudppSegmentedScan(scanplan,
+			d_fdfluxSegment,
+			d_compactedcdPixelArray, //?????
+			d_segmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the segment fdflux scan");
+
+	// Destroy the segment prefix scan plan
+	res = cudppDestroyPlan(scanplan);
+	checkcudppSuccess(res, "Error destroying CUDPP segment float sum scan Plan");
+
+	/*
+	if(level == 28)
+	{
+		cudaMalloc((void**) &compactedPix,  compactedArraysize*sizeof(double));
+		cudaMalloc((void**) &fdfluxsegment, compactedArraysize*sizeof(double));
+
+		copypixel<<<grid1, block1>>>(d_compactedcdPixelArray, compactedPix, compactedArraysize);
+
+		scanconfig.op = CUDPP_ADD;
+		scanconfig.datatype = CUDPP_DOUBLE;
+		scanconfig.algorithm = CUDPP_SEGMENTED_SCAN;
+		scanconfig.options = CUDPP_OPTION_BACKWARD | CUDPP_OPTION_INCLUSIVE;
+
+		res = cudppPlan(theCudpp, &scanplan, scanconfig, compactedArraysize, 1, 0);
+		checkcudppSuccess(res, "Error creating CUDPP segment float sum scan Plan");
+
+		res = cudppSegmentedScan(scanplan,
+				fdfluxsegment,
+				compactedPix, //?????
+				d_segmentMask,
+				compactedArraysize);
+		checkcudppSuccess(res, "Error in running the segment fdflux scan");
+
+		// Destroy the segment prefix scan plan
+		res = cudppDestroyPlan(scanplan);
+		checkcudppSuccess(res, "Error destroying CUDPP segment float sum scan Plan");
+	}*/
+
+	//	computefdflux(d_fdfluxSegment, d_compactedcdPixelArray, d_segmentMask, compactedArraysize);
+	////////////////////////////////////////////////////
+	if(level == 1)
+	{
+		//checkCudaErrors(cudaMalloc((void**) &d_prunedSegmentMask, compactedArraysize*sizeof(unsigned int)));
+		checkCudaErrors(cudaMalloc((void**) &d_numValidObj, sizeof(unsigned int)));
+	}
+
+	segmentmask_prune_kernel<<<grid1, block1>>>(
+			d_segmentMask,
+			d_prunedSegmentMask,
+			d_pixelCountSegment,
+			compactedArraysize,
+			deb_maxarea);
+	////////////////////////////////////////////////////
+
+	//create sum reduce configuration(for computing the num. valid objs).
+	config.op = CUDPP_ADD;
+	config.datatype = CUDPP_UINT;
+	config.algorithm = CUDPP_REDUCE;
+
+	res = cudppPlan(theCudpp, &scanplan, config, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP reduce Plan(to get the num. of valid obj)");
+
+	res = cudppReduce(scanplan,
+			d_numValidObj,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP reduce(to get the num. of valid obj)");
+
+	// Destroy the reduce plan
+	res = cudppDestroyPlan(scanplan);
+	checkcudppSuccess(res, "Error destroying CUDPP reduce Plan(to get the num. of valid obj)");
+
+	cudaMemcpy(&h_numValidObj, d_numValidObj, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+	//std::cout << "number of valid object in the deb scan is " << (*_h_finalValidObj) << std::endl;
+	*numValidObj = h_numValidObj;
+	///////////////////////////////////////////////////
+
+	//allocate memory space to store the valid object properties.
+	checkCudaErrors(cudaMalloc((void**) &d_debPixelCountArray[level], h_numValidObj*sizeof(unsigned int)));
+	checkCudaErrors(cudaMalloc((void**) &d_debXminArray[level], h_numValidObj*sizeof(unsigned int)));
+	checkCudaErrors(cudaMalloc((void**) &d_debXmaxArray[level], h_numValidObj*sizeof(unsigned int)));
+	checkCudaErrors(cudaMalloc((void**) &d_debYminArray[level], h_numValidObj*sizeof(unsigned int)));
+	checkCudaErrors(cudaMalloc((void**) &d_debYmaxArray[level], h_numValidObj*sizeof(unsigned int)));
+	checkCudaErrors(cudaMalloc((void**) &d_debFdpeakArray[level], h_numValidObj*sizeof(float)));
+	checkCudaErrors(cudaMalloc((void**) &d_debDpeakArray[level], h_numValidObj*sizeof(float)));
+	checkCudaErrors(cudaMalloc((void**) &d_debFdfluxArray[level], h_numValidObj*sizeof(float)));
+	checkCudaErrors(cudaMalloc((void**) &d_debDthresh[level], h_numValidObj*sizeof(float)));
+
+	checkCudaErrors(cudaMalloc((void**) &d_debFlagArray[level], h_numValidObj*sizeof(int)));
+	checkCudaErrors(cudaMalloc((void**) &d_debOk[level], h_numValidObj*sizeof(int)));
+
+	checkCudaErrors(cudaMalloc((void**) &d_debParentLabel[level], h_numValidObj*sizeof(unsigned int)));
+
+	////////////////////////////////////////////////////
+	if(level == 1)
+	{
+		checkCudaErrors(cudaMalloc((void**) &d_numCompactedObj, sizeof(size_t)));
+	}
+
+	//create compact scan configuration(for computing the properties of valid objs).
+	//CUDPPConfiguration compactconfig1;
+	config.datatype = CUDPP_INT;
+	config.algorithm = CUDPP_COMPACT;
+
+	//create the cudpp compact plan
+	res = cudppPlan(theCudpp, &compactplan, config, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP compact Plan(to compute the properties of objs in deb)");
+
+	res = cudppCompact(compactplan,
+			d_debPixelCountArray[level],
+			d_numCompactedObj,
+			d_pixelCountSegment,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_pixelCountArray properties of valid objs)");
+
+	res = cudppCompact(compactplan,
+			d_debXminArray[level],
+			d_numCompactedObj,
+			d_xminSegment,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_xminArray properties of valid objs)");
+
+	res = cudppCompact(compactplan,
+			d_debXmaxArray[level],
+			d_numCompactedObj,
+			d_xmaxSegment,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_xmaxArray properties of valid objs)");
+
+	res = cudppCompact(compactplan,
+			d_debYminArray[level],
+			d_numCompactedObj,
+			d_yminSegment,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_yminArray properties of valid objs)");
+
+	res = cudppCompact(compactplan,
+			d_debYmaxArray[level],
+			d_numCompactedObj,
+			d_ymaxSegment,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_ymaxArray properties of valid objs)");
+
+	res = cudppCompact(compactplan,
+			d_debParentLabel[level],
+			d_numCompactedObj,
+			d_compactedParentLabel,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_ymaxArray properties of valid objs)");
+
+	// Destroy the compact plan
+	res = cudppDestroyPlan(compactplan);
+	checkcudppSuccess(res, "Error destroying CUDPP compact Plan(to compute the int properties of valid objs)");
+
+	///////////////////////////////////////////////
+	//create compact scan configuration(for computing the properties of valid objs).
+	config.datatype = CUDPP_FLOAT;
+	config.algorithm = CUDPP_COMPACT;
+
+	res = cudppPlan(theCudpp, &compactplan, config, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP compact Plan(to compute the float properties of valid objs)");
+
+	res = cudppCompact(compactplan,
+			d_debFdpeakArray[level],
+			d_numCompactedObj,
+			d_fdpeakSegment,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_fdpeakArray properties of valid objs)");
+
+	res = cudppCompact(compactplan,
+			d_debDpeakArray[level],
+			d_numCompactedObj,
+			d_dpeakSegment,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_dpeakArray properties of valid objs)");
+
+	res = cudppCompact(compactplan,
+			d_debFdfluxArray[level],
+			d_numCompactedObj,
+			d_fdfluxSegment,
+			d_prunedSegmentMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_fdfluxArray properties of valid objs)");
+
+	// Destroy the compact plan
+	res = cudppDestroyPlan(compactplan);
+	checkcudppSuccess(res, "Error destroying CUDPP compact Plan(to compute the float properties of valid objs)");
+
+<<<<<<< .mine
+	/*
+	if(level == 28)
+	{
+		checkCudaErrors(cudaMalloc((void**) &fdfluxArray, h_numValidObj*sizeof(double)));
+		config.datatype = CUDPP_DOUBLE;
+		config.algorithm = CUDPP_COMPACT;
+
+=======
+>>>>>>> .r29
+		res = cudppPlan(theCudpp, &compactplan, config, compactedArraysize, 1, 0);
+
+		res = cudppCompact(compactplan,
+				fdfluxArray,
+				d_numCompactedObj,
+				fdfluxsegment,
+				d_prunedSegmentMask,
+				compactedArraysize);
+		checkcudppSuccess(res, "Error in running the  CUDPP compact (to compute the d_fdfluxArray properties of valid objs)");
+
+		// Destroy the compact plan
+		res = cudppDestroyPlan(compactplan);
+		checkcudppSuccess(res, "Error destroying CUDPP compact Plan(to compute the float properties of valid objs)");
+
+	}*/
+	////////////////////////////////////////////////////////////////
+
+	cudaMemset(d_debFlagArray[level], 0, h_numValidObj * sizeof(int));
+
+	grid1 = (h_numValidObj-1)/(MAX_THREADS_PER_BLK)+1;
+	block1 = (MAX_THREADS_PER_BLK);
+	checkTruncKernel<<<grid1, block1>>>(d_debXminArray[level],
+			d_debXmaxArray[level],
+			d_debYminArray[level],
+			d_debYmaxArray[level],
+			d_debFlagArray[level],
+			h_numValidObj,
+			width,
+			height);
+
+	okInit_kernel<<<grid1, block1>>>(d_debOk[level], h_numValidObj);
+
+////////////////////////////////////////////////////////////////
+	if(level == 1)
+	{
+		//checkCudaErrors(cudaMalloc((void**) &d_compactMask2, compactedArraysize*sizeof(unsigned int)));
+	}
+
+	//create backward segment scan configuration(to compact the label and index array)
+	CUDPPConfiguration segconfig;
+	segconfig.op = CUDPP_ADD;
+	segconfig.datatype = CUDPP_UINT;
+	segconfig.algorithm = CUDPP_SEGMENTED_SCAN;
+	segconfig.options = CUDPP_OPTION_FORWARD | CUDPP_OPTION_INCLUSIVE;
+
+	//create prefix scan plan
+	//CUDPPHandle segscanplan = 0;
+	res = cudppPlan(theCudpp, &segscanplan, segconfig, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP backward segment scan Plan(for segment end mask scan)");
+
+	//perform a forward segment sum scan of the segment end mask array (for label and index array compact)
+	res = cudppSegmentedScan(segscanplan, d_compactMask, d_prunedSegmentMask,
+			d_segmentMask, compactedArraysize);
+	checkcudppSuccess(res, "Error in running the segment sum scan(for segment end mask array)");
+
+	// Destroy the segment scan plan
+	res = cudppDestroyPlan(segscanplan);
+	checkcudppSuccess(res, "Error destroying CUDPP prefix scan Plan(for segment end mask array)");
+
+//////////////////////////////////
+	if(level == 1)
+		checkCudaErrors(cudaMalloc((void**) &d_numValidPix, sizeof(unsigned int)));
+
+	//create sum reduce configuration(for computing the num. valid pixels).
+	scanconfig.op = CUDPP_ADD;
+	scanconfig.datatype = CUDPP_UINT;
+	scanconfig.algorithm = CUDPP_REDUCE;
+
+	res = cudppPlan(theCudpp, &scanplan, scanconfig, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP reduce Plan(to get the num. of valid pixels)");
+
+	res = cudppReduce(scanplan, d_numValidPix, d_compactMask, compactedArraysize);
+	checkcudppSuccess(res, "Error in running the  CUDPP reduce(to get the num. of valid pixels)");
+
+	// Destroy the reduce plan
+	res = cudppDestroyPlan(scanplan);
+	checkcudppSuccess(res, "Error destroying CUDPP reduce Plan(to get the num. of valid pixels)");
+
+	checkCudaErrors(cudaMemcpy(&h_numValidPix, d_numValidPix, sizeof(unsigned int),
+			cudaMemcpyDeviceToHost));
+	//std::cout << "number of valid pixel after deb is " << (*_h_finalValidPix) << std::endl;
+
+////////////////////////////////////////////////////////////
+	//allocate space for final compacted label and index array
+	checkCudaErrors(cudaMalloc((void**) &d_finalDebObjIndexArray[level], h_numValidObj*sizeof(unsigned int)));
+	checkCudaErrors(cudaMalloc((void**) &d_finalDebPixelIndexArray[level], h_numValidPix*sizeof(unsigned int)));
+	checkCudaErrors(cudaMalloc((void**) &d_finalDebLabelArray[level], h_numValidPix*sizeof(unsigned int)));
+	checkCudaErrors(cudaMalloc((void**) &d_numCompactedPix, sizeof(size_t)));
+
+	//create compact scan configuration(for the final compact of label and index array).
+	config.datatype = CUDPP_UINT;
+	config.algorithm = CUDPP_COMPACT;
+
+	res = cudppPlan(theCudpp, &compactplan, config, compactedArraysize, 1, 0);
+	checkcudppSuccess(res, "Error creating CUDPP compact Plan(for the final compact of label and index array)");
+
+	res = cudppCompact(compactplan,
+			d_finalDebLabelArray[level],
+			d_numCompactedPix,
+			d_compactedLabelArray,
+			d_compactMask,
+			compactedArraysize);
+	checkcudppSuccess(res, "Error running final label compact");
+	res = cudppCompact(compactplan,
+			d_finalDebPixelIndexArray[level],
+			d_numCompactedPix,
+			d_compactedIndexArray,
+			d_compactMask,
+			compactedArraysize);
+
+	// Destroy the compact plan
+	res = cudppDestroyPlan(compactplan);
+	checkcudppSuccess(res, "Error running final index compact");
+
+	////////////////////////////////////////////////////////////
+	//initialize the segment mask array according to the final compacted label array.
+	//(1 for the start pos of a segment, 0 otherwise)
+	int grid2 = ((h_numValidPix)-1)/(MAX_THREADS_PER_BLK)+1;
+	int block2 = (MAX_THREADS_PER_BLK);
+	segmentMaskInitKernel<<<grid2, block2>>>(d_finalDebLabelArray[level],
+			d_segmentMask, (h_numValidPix));
+
+	//create prefix sum scan configuration(to make the final labels consecutive).
+	scanconfig.op = CUDPP_ADD;
+	scanconfig.datatype = CUDPP_INT;
+	scanconfig.algorithm = CUDPP_SCAN;
+	scanconfig.options = CUDPP_OPTION_FORWARD | CUDPP_OPTION_INCLUSIVE;
+
+	//create prefix scan plan
+	res = cudppPlan(theCudpp, &scanplan, scanconfig, (h_numValidPix), 1, 0);
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error creating CUDPP segment mask array scan Plan\n");
+		exit(-1);
+	}
+
+	//perform a prefix sum scan of the segment mask array and output the result to the compacted label array
+	//as consecutive labels
+	res = cudppScan(scanplan, d_finalDebLabelArray[level], d_segmentMask, (h_numValidPix));
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error in running the segment mask scan\n");
+		exit(-1);
+	}
+
+	// Destroy the prefix scan plan
+	res = cudppDestroyPlan(scanplan);
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error destroying CUDPP prefix scan Plan\n");
+		exit(-1);
+	}
+	/////////////////////////////////////////////////////////////
+
+	//create prefix sum scan configuration(to record the pos of each obj in final index array).
+	scanconfig.op = CUDPP_ADD;
+	scanconfig.datatype = CUDPP_UINT;
+	scanconfig.algorithm = CUDPP_SCAN;
+	scanconfig.options = CUDPP_OPTION_FORWARD | CUDPP_OPTION_EXCLUSIVE;
+
+	//create prefix scan plan
+	scanplan = 0;
+	res = cudppPlan(theCudpp, &scanplan, scanconfig, h_numValidObj, 1, 0);
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error creating CUDPP segment mask array scan Plan\n");
+		exit(-1);
+	}
+
+	//perform a prefix sum scan of the pixel count array and output the result to d_finalObjIndexArray
+	res = cudppScan(scanplan, d_finalDebObjIndexArray[level], d_debPixelCountArray[level], h_numValidObj);
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error in running the segment mask scan\n");
+		exit(-1);
+	}
+
+	// Destroy the prefix scan plan
+	res = cudppDestroyPlan(scanplan);
+	if (CUDPP_SUCCESS != res)
+	{
+		printf("Error destroying CUDPP prefix scan Plan\n");
+		exit(-1);
+	}
+	/////////////////////////////////////////////////////////////
+
+	//must be computed after get the right d_finalDebObjIndexArray
+	debDthreshInit_kernel<<<grid1, block1>>>(d_debDthresh[level],
+			d_finalDebObjIndexArray[level],
+			d_finalDebPixelIndexArray[level],
+			d_rootLabelArray,
+			d_multiThreshArray,
+			level,
+			h_numValidObj,
+			h_finalValidObj[0]);
+
+	////////////////////////////////////////////////////////////
+
+	if(level == 31)
+	{
+		//checkCudaErrors(cudaFree(d_compactMask2));
+		checkCudaErrors(cudaFree(d_numValidObj));
+		checkCudaErrors(cudaFree(d_numCompactedObj));
+		checkCudaErrors(cudaFree(d_numValidPix));
+		checkCudaErrors(cudaFree(d_numCompactedPix));
+	}
+
+	return (size_t)h_numValidPix;
+}
+
+__global__ void test(
+		double* d_fdflux,
+		unsigned int *pixcount,
+		unsigned int *d_finalDebPixelIndexArray,
+		unsigned int *d_finalDebObjIndexArray,
+		float *d_cdpixArray,
+		unsigned int nobj)
+{
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+<<<<<<< .mine
+	if(tid >= nobj)
+		return;
+=======
+	static int count = 0;
+
+	int grid_obj = ((int)h_finalValidObj[level]-1)/(MAX_THREADS_PER_BLK)+1;
+	int block_obj = (MAX_THREADS_PER_BLK);
+>>>>>>> .r29
+
+	int count = pixcount[tid];
+	int firidx = d_finalDebObjIndexArray[tid];
+	double flux = 0;
+
+<<<<<<< .mine
+	for(int t=0; t<count; t++)
+	{
+		flux += d_cdpixArray[d_finalDebPixelIndexArray[firidx++]];
+	}
+=======
+	decidePrune1_kernel<<<grid_obj, block_obj>>>(
+			d_flag,
+			d_numson,
+			d_debFdfluxArray[level],
+			d_debDthresh[level],
+			d_debPixelCountArray[level],
+			d_finalDebPixelIndexArray[level],
+			d_finalDebObjIndexArray[level],
+			d_debOk[level],
+			d_debOk[level-1],
+			d_debParentLabel[level],
+			d_rootLabelArray,
+			d_debFdfluxArray[0],
+			h_finalValidObj[level],
+			DEBLEND_MINCONT);
+>>>>>>> .r29
+
+<<<<<<< .mine
+	if(abs(d_fdflux[tid]-flux) >= 0.000001)
+		printf("fdflux in kernel is %d, %lf, %lf\n", tid, flux, d_fdflux[tid]-flux);
+=======
+	decidePrune2_kernel<<<grid_obj, block_obj>>>(d_flag,
+			d_numson,
+			d_debOk[level],
+			d_debParentLabel[level],
+			h_finalValidObj[level]);
+>>>>>>> .r29
+
+<<<<<<< .mine
+}
+=======
+	if(level == 31)
+	{
+		unsigned int *h_flag = (unsigned int*)malloc(h_finalValidObj[level] * sizeof(unsigned int));
+		cudaMemcpy(h_flag, d_flag, h_finalValidObj[level]*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+>>>>>>> .r29
+
+<<<<<<< .mine
+__global__ void test1(
+		float *d_dthresh,
+		float *d_fdflux,
+		unsigned int *d_debXminArray,
+		unsigned int *d_debYminArray,
+		unsigned int *d_finalDebObjIndexArray,
+		unsigned int *d_finalDebPixelIndexArray,
+		int *d_rootLabelArray,
+		float *d_rootfdflux,
+		unsigned int *d_fdnpix,
+		int *d_debOk,
+		double deblend_mincont,
+		unsigned int h_finalValidObj) {
+=======
+		float *h_fdflux = (float*)malloc(h_finalValidObj[level] * sizeof(float));;
+		cudaMemcpy(h_fdflux, d_debFdfluxArray[level], h_finalValidObj[level]*sizeof(float), cudaMemcpyDeviceToHost);
+>>>>>>> .r29
+
+<<<<<<< .mine
+	const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+	if(tid >= h_finalValidObj)
+		return;
+
+	/*
+	if(d_debXminArray[tid] == 1160 && d_debYminArray[tid] == 3789)
+	{
+		printf("1, %d\n", d_flag[tid]);
+=======
+		for(int i=0; i<h_finalValidObj[level]; i++)
+		{
+			count += h_flag[i];
+			if(h_flag[i])
+			printf("deb fdflux is %f\n", h_fdflux[i]);
+		}
+		free(h_flag);
+>>>>>>> .r29
+	}
+
+<<<<<<< .mine
+	if(d_debXminArray[tid] == 1159 && d_debYminArray[tid] == 3792)
+=======
+	if(level==1)
+>>>>>>> .r29
+	{
+<<<<<<< .mine
+		printf("2, %d\n", d_flag[tid]);
+	}
+=======
+		/*
+		unsigned int *h_ok;
+		int count1 = 0;
+		h_ok = (unsigned int*)malloc(h_finalValidObj[0] * sizeof(unsigned int));
+		cudaMemcpy(h_ok, d_debOk[0], h_finalValidObj[0]*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+		for(int i=0; i<h_finalValidObj[0]; i++)
+		{
+			count += h_ok[i];
+			count1 += h_ok[i];
+		}
+		free(h_ok); */
+>>>>>>> .r29
+
+<<<<<<< .mine
+	if(d_debXminArray[tid] == 643 && d_debYminArray[tid] == 3858)
+	{
+		printf("3, %d\n", d_flag[tid]);
+=======
+		printf("num of objects needed to output is %d\n", count);
+		//printf("num of objects needed to output on 0 level is %d\n", count1);
+>>>>>>> .r29
+	}
+	//decidePrune3_kernel();
+
+<<<<<<< .mine
+	if(d_debXminArray[tid] == 644 && d_debYminArray[tid] == 3861)
+	{
+		printf("4, %d\n", d_flag[tid]);
+	}
+
+	if((d_debXminArray[tid] == 1160 && d_debYminArray[tid] == 3789)
+			|| (d_debXminArray[tid] == 1159 && d_debYminArray[tid] == 3792)
+			|| (d_debXminArray[tid] == 643 && d_debYminArray[tid] == 3858)
+			|| (d_debXminArray[tid] == 1001))*/
+	if(d_debXminArray[tid] == 547 && d_debYminArray[tid] == 1798)
+	{
+
+		unsigned int first_index = d_finalDebPixelIndexArray[d_finalDebObjIndexArray[tid]];
+		int rootlabel = d_rootLabelArray[first_index];
+		double value0 = d_rootfdflux[rootlabel-1] * deblend_mincont;
+
+		if(d_fdflux[tid] - d_dthresh[tid]*d_fdnpix[tid] >= value0)
+		{
+			printf("%f, %f, %d\n", d_fdflux[tid] - d_dthresh[tid]*d_fdnpix[tid], value0, d_debOk[tid]);
+		}
+		//printf("%f, \n", d_dthresh[tid]);
+	}
+=======
+	//unsigned int 	*d_label;
+	//unsigned int	*d_parentSegmentMask;
+
+	//checkCudaErrors(cudaMalloc((void**) &d_label, h_finalValidObj[level]*sizeof(unsigned int)));
+	//checkCudaErrors(cudaMalloc((void**) &d_parentSegmentMask, h_finalValidObj[level]*sizeof(unsigned int)));
+>>>>>>> .r29
+}
+
+<<<<<<< .mine
+void cut_branch(int level, double DEBLEND_MINCONT) {
+
+	if(level == 0)
+	{
+		int count = 0;
+
+		unsigned int *h_flag = (unsigned int*)malloc(h_finalValidObj[level] * sizeof(unsigned int));
+		cudaMemcpy(h_flag, d_debOk[level], h_finalValidObj[level]*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+		for(int i=0; i<h_finalValidObj[level]; i++)
+		{
+			if(h_flag[i])
+				count++;
+		}
+		printf("%d\t%d\n", level, count);
+
+		free(h_flag);
+		return;
+	}
+=======
+	//cuttinglabelInit_kernel<<<grid_obj, block_obj>>>(d_label, h_finalValidObj[level]);
+>>>>>>> .r29
+
+<<<<<<< .mine
+	int grid_obj = ((int)h_finalValidObj[level]-1)/(MAX_THREADS_PER_BLK)+1;
+	int block_obj = (MAX_THREADS_PER_BLK);
+=======
+	/////////////////////////////////////////////////////////////////////////////////
+	//create the label array start with 1 2 3......
+//	CUDPPConfiguration scanconfig;
+//	scanconfig.op = CUDPP_ADD;
+//	scanconfig.datatype = CUDPP_UINT;
+//	scanconfig.algorithm = CUDPP_SCAN;
+//	scanconfig.options = CUDPP_OPTION_FORWARD | CUDPP_OPTION_INCLUSIVE;
+//
+//	//create prefix scan plan
+//	CUDPPHandle scanplan = 0;
+//	CUDPPResult res = cudppPlan(theCudpp, &scanplan, scanconfig, h_finalValidObj[level], 1, 0);
+//	if (CUDPP_SUCCESS != res)
+//	{
+//		printf("Error creating CUDPP segment mask array scan Plan\n");
+//		exit(-1);
+//	}
+//
+//	//perform a prefix sum scan of the d_label to get the actual label for each object
+//	res = cudppScan(scanplan, d_label, d_label, h_finalValidObj[level]);
+//	if (CUDPP_SUCCESS != res)
+//	{
+//		printf("Error in running the segment mask scan\n");
+//		exit(-1);
+//	}
+//
+//	// Destroy the prefix scan plan
+//	res = cudppDestroyPlan(scanplan);
+//	if (CUDPP_SUCCESS != res)
+//	{
+//		printf("Error destroying CUDPP prefix scan Plan\n");
+//		exit(-1);
+//	}
+//
+//	//////////////////////////////////////////////////////////////////////////
+//	//sor the label array by parent label array.
+//	CUDPPConfiguration sort_config;
+//	sort_config.datatype = CUDPP_UINT;
+//	sort_config.algorithm = CUDPP_SORT_RADIX;
+//	sort_config.options = CUDPP_OPTION_KEY_VALUE_PAIRS;
+//
+//	//create the cudpp sort plan
+//	CUDPPHandle sortplan = 0;
+//	res = cudppPlan(theCudpp, &sortplan, sort_config, h_finalValidObj[level], 1, 0);
+//	if (CUDPP_SUCCESS != res)
+//	{
+//		printf("Error creating CUDPP sort Plan in %s at line %d\n", __FILE__, __LINE__);
+//		exit(-1);
+//	}
+//	// Run the sort
+//	res = cudppSort(sortplan, d_debParentLabel[level], d_label, h_finalValidObj[level]);
+//	if (CUDPP_SUCCESS != res)
+//	{
+//		printf("Error in cudppSort() for sorting compacted labels in %s at line %d\n", __FILE__, __LINE__);
+//		exit(-1);
+//	}
+//
+//	// Destroy the sort plan
+//	res = cudppDestroyPlan(sortplan);
+//	if (CUDPP_SUCCESS != res)
+//	{
+//		printf("Error destroying CUDPP sort Plan in %s at line %d\n", __FILE__, __LINE__);
+//		exit(-1);
+//	}
+//
+//	segmentMaskInitKernel<<<grid_obj, block_obj>>>(d_debParentLabel[level], d_parentSegmentMask, h_finalValidObj[level]);
+>>>>>>> .r29
+
+	unsigned int	*d_flag;
+	unsigned int	*d_numson;
+	checkCudaErrors(cudaMalloc((void**) &d_flag,   h_finalValidObj[level]*sizeof(unsigned int)));
+	checkCudaErrors(cudaMalloc((void**) &d_numson, h_finalValidObj[level-1]*sizeof(unsigned int)));
+	checkCudaErrors(cudaMemset(d_numson, 0, h_finalValidObj[level-1]*sizeof(unsigned int)));
+
+	decidePrune1_kernel<<<grid_obj, block_obj>>>(
+			d_flag,
+			d_numson,
+			d_debFdfluxArray[level],
+			d_debDthresh[level],
+			d_debPixelCountArray[level],
+			d_finalDebPixelIndexArray[level],
+			d_finalDebObjIndexArray[level],
+			d_debOk[level],
+			d_debOk[level-1],
+			d_debParentLabel[level],
+			d_rootLabelArray,
+			d_debFdfluxArray[0],
+			h_finalValidObj[level],
+			DEBLEND_MINCONT);
+
+	/*
+	if(level == 25)
+	{
+		test1<<<(h_finalValidObj[level]-1)/256+1,256>>>(
+				d_debDthresh[level],
+				d_debFdfluxArray[level],
+				d_debXminArray[level],
+				d_debYminArray[level],
+				d_finalDebObjIndexArray[level],
+				d_finalDebPixelIndexArray[level],
+				d_rootLabelArray,
+				d_debFdfluxArray[0],
+				d_debPixelCountArray[level],
+				d_debOk[level],
+				DEBLEND_MINCONT,
+				h_finalValidObj[level]);
+	}*/
+
+<<<<<<< .mine
+	decidePrune2_kernel<<<grid_obj, block_obj>>>(d_flag,
+			d_numson,
+			d_debOk[level],
+			d_debOk[level-1],
+			d_debParentLabel[level],
+			h_finalValidObj[level]);
+
+	if(level)
+	{
+		int count = 0;
+
+		unsigned int *h_flag = (unsigned int*)malloc(h_finalValidObj[level] * sizeof(unsigned int));
+		cudaMemcpy(h_flag, d_flag, h_finalValidObj[level]*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+		for(int i=0; i<h_finalValidObj[level]; i++)
+		{
+			if(h_flag[i])
+				count++;
+		}
+		printf("%d\t%d\n", level, count);
+
+		free(h_flag);
+	}
+
+	cudaFree(d_flag);
+	cudaFree(d_numson);
+
+=======
+	//checkCudaErrors(cudaFree(d_label));
+	//checkCudaErrors(cudaFree(d_parentSegmentMask));
+	//checkCudaErrors(cudaFree(d_pruneFlag));
+>>>>>>> .r29
+}
+
+extern "C" void clear_deblend(int _deblend_nthresh) {
+
+
+	//destroy the result for deb compact and sort.
+	/*
+	free(d_compactedDebLabelArray);
+	free(d_compactedDebIndexArray);
+	free(d_compactedDebPixelArray);
+	free(d_compactedDebCdPixelArray);
+	free(d_segmentDebMask);*/
+
+	free(d_debPixelCountArray);
+	free(d_debXminArray);
+	free(d_debXmaxArray);
+	free(d_debYminArray);
+	free(d_debYmaxArray);
+	free(d_debFdpeakArray);
+	free(d_debDpeakArray);
+	free(d_debFdfluxArray);
+	free(d_debDthresh);
+
+	free(d_debFlagArray);
+	free(d_debOk);
+	free(d_debParentLabel);
+
+	free(d_finalDebObjIndexArray);
+	free(d_finalDebPixelIndexArray);
+	free(d_finalDebLabelArray);
+
+
+
+	checkCudaErrors(cudaFree(d_multiThreshArray));
+	checkCudaErrors(cudaFree(d_rootLabelArray));
+
+	//another 11 global vars to be freed
+}

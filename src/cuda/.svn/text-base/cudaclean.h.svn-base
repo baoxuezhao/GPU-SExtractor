@@ -1,0 +1,6 @@
+#ifndef CUDACLEAN_H_
+#define CUDACLEAN_H_
+
+void run_clean(unsigned int *masterIndex, double clean_param, int numobj);
+
+#endif /* CUDACLEAN_H_ */

@@ -1,0 +1,3 @@
+gcc -c -I /usr/local/cuda/include imagescan.c
+nvcc -c cuscan_kernel.cu
+ar cru libcuda.a imagescan.o cuscan_kernel.o
