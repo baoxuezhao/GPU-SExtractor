@@ -68,6 +68,11 @@ Compile steps:
 
 5) run make install to install the executable
 
+==========
+License
+
+As the original SExtractor package, the GPU-SExtractor follows the CeCILL license.
+For details of the copyright information, please refer to the file ./COPYRIGHT.
 
 ==========
 
