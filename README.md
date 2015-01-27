@@ -84,3 +84,7 @@ sex -c param.sex image4k4k.fits
 
 Citation:
 Baoxue Zhao,  Qiong Luo, Chao Wu. "Parallelizing Astronomical Source Extraction on the GPU." eScience (eScience), 2013 IEEE 9th International Conference on. IEEE, 2013.
+
+==========
+The author of the CUDA parallel work: Baoxue Zhao.
+Email: baoxue.zhao@gmail.com
