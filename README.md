@@ -1,11 +1,8 @@
-GPU-SExtractor
-==============
+# GPU-SExtractor
 
 Parallel Astronomical Source Extraction tool based on SExtractor
 
-==========
-
-Main contribution
+## Main contribution
 
 In this work, we propose to use the GPU (Graphics Processing Unit) to accelerate source extraction. Our work is based on SExtractor, an astronomical source extraction tool widely used in astronomy projects, and study its parallelization on the GPU. In GPU-SExtractor, we re-design and parallelize each major step in SExtractor:
 
@@ -24,10 +21,7 @@ SExtractor on a desktop with an Intel i7 CPU and an NVIDIA GTX670 GPU on a set o
 The results show that our GPU-SExtractor outperforms the original SExtractor by a factor of 6, taking a merely 1.9 second to process a typical
 4KX4K image containing 167,000 celestial objects.
 
-
-==========
-
-File description
+## File description
 
 The CUDA code is in the src/cuda directory.
 
@@ -41,11 +35,10 @@ cudadeblend.cu(.h) Parallel Multi-level Object Deblending
 
 cudaanalyse.cu(.h) Parallel Object Analysis
 
-==========
 
-Compile
+## Compile
 
-Software Dependency:
+### Software Dependency:
 
 Besides the software required for SExtractor (described in "./doc/SExtractor installation - MediaWiki.html"), the following SDKs and libraries are
 required
@@ -54,7 +47,7 @@ required
 
 2) CUDPP version 2.2
 
-Compile steps:
+### Compile steps:
 
 1) install the dependent softwares following the instructions in "./doc/SExtractor installation - MediaWiki.html",
 
@@ -68,23 +61,18 @@ Compile steps:
 
 5) run make install to install the executable
 
-==========
-License
+## License
 
 As the original SExtractor package, the GPU-SExtractor follows the CeCILL license.
 For details of the copyright information, please refer to the file ./COPYRIGHT.
 
-==========
-
-Sample Usage:
+## Sample Usage:
 
 sex -c param.sex image4k4k.fits
 
-==========
-
-Citation:
+## Citation:
 Baoxue Zhao,  Qiong Luo, Chao Wu. "Parallelizing Astronomical Source Extraction on the GPU." eScience (eScience), 2013 IEEE 9th International Conference on. IEEE, 2013.
 
-==========
+
 The author of the CUDA parallel work: Baoxue Zhao.
 Email: baoxue.zhao@gmail.com
